@@ -1697,6 +1697,8 @@ impl MachineSetup {
                 // Normal is the default, so only a deliberate choice is written.
                 flux_mode: (flux.mode != crate::config::FluxMode::default())
                     .then(|| flux.mode.label().to_string()),
+                flux_disk_change: (flux.disk_change != crate::config::FluxDiskChange::default())
+                    .then(|| flux.disk_change.label().to_string()),
             });
         }
         let playlist = &self.df_playlists[idx];
@@ -1717,6 +1719,7 @@ impl MachineSetup {
             flux_port: None,
             flux_cable: None,
             flux_mode: None,
+            flux_disk_change: None,
         })
     }
 

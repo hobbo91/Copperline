@@ -1116,6 +1116,42 @@ impl FluxMode {
     }
 }
 
+/// How to tell whether a disk is in a physical drive.
+///
+/// The floppy bus has no line that simply says so. What it has is `/DSKCHG`, a
+/// latch the drive asserts when a disk is taken out and clears only once the
+/// head steps with one back in -- so on a drive that does not fit the line, or
+/// has not stepped since, it reads "changed" indefinitely and says nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FluxDiskChange {
+    /// Find out by reading a little of the disk: no index pulse coming round
+    /// means nothing is turning, so the slot is empty. Works on any drive, at
+    /// the cost of spinning the spindle to ask.
+    #[default]
+    Probe,
+    /// Believe `/DSKCHG`. Silent and immediate, but only right on a drive that
+    /// really fits the line -- and many do not, reporting an empty slot for ever
+    /// with a disk sitting in them.
+    Pin,
+}
+
+impl FluxDiskChange {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "probe" | "index" => Some(Self::Probe),
+            "pin" | "dskchg" => Some(Self::Pin),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Probe => "probe",
+            Self::Pin => "pin",
+        }
+    }
+}
+
 /// A real 3.5" drive attached to one floppy bay, from `[floppy.dfN] flux = ...`.
 ///
 /// Held apart from [`FloppyDriveConfig`] because a physical drive has no image
@@ -1136,6 +1172,8 @@ pub struct FloppyFluxConfig {
     pub cable: String,
     /// How many revolutions of each track to capture.
     pub mode: FluxMode,
+    /// How an empty drive is told apart from a loaded one.
+    pub disk_change: FluxDiskChange,
 }
 
 impl Default for FloppyFluxConfig {
@@ -1149,6 +1187,7 @@ impl Default for FloppyFluxConfig {
             port: None,
             cable: "a".to_string(),
             mode: FluxMode::default(),
+            disk_change: FluxDiskChange::default(),
         }
     }
 }
@@ -1783,6 +1822,9 @@ pub struct ConfigOverrides {
     /// How hard to work at each track (`--floppy-flux-mode DFN MODE`). Same as
     /// `[floppy.dfN] flux_mode`.
     pub floppy_flux_mode: [Option<String>; 4],
+    /// How a disk in the drive is sensed (`--floppy-flux-disk-change DFN HOW`).
+    /// Same as `[floppy.dfN] flux_disk_change`.
+    pub floppy_flux_disk_change: [Option<String>; 4],
     /// Let the emulator write to the physical disk (`--floppy-flux-writable
     /// DFN`), leaving only the disk's own tab in the way. Same as
     /// `[floppy.dfN] write_protected = false`.
@@ -1873,6 +1915,7 @@ impl ConfigOverrides {
             && self.floppy_flux_port.iter().all(Option::is_none)
             && self.floppy_flux_cable.iter().all(Option::is_none)
             && self.floppy_flux_mode.iter().all(Option::is_none)
+            && self.floppy_flux_disk_change.iter().all(Option::is_none)
             && !self.floppy_flux_writable.iter().any(|w| *w)
             && self.joystick.is_none()
             && self.mouse_sensitivity.is_none()
@@ -1950,6 +1993,7 @@ impl ConfigOverrides {
                     || self.floppy_flux_port[idx].is_some()
                     || self.floppy_flux_cable[idx].is_some()
                     || self.floppy_flux_mode[idx].is_some()
+                    || self.floppy_flux_disk_change[idx].is_some()
                     || self.floppy_flux_writable[idx];
                 if !touched {
                     continue;
@@ -1971,6 +2015,9 @@ impl ConfigOverrides {
                 }
                 if let Some(mode) = &self.floppy_flux_mode[idx] {
                     bay.flux_mode = Some(mode.clone());
+                }
+                if let Some(how) = &self.floppy_flux_disk_change[idx] {
+                    bay.flux_disk_change = Some(how.clone());
                 }
                 if self.floppy_flux_writable[idx] {
                     bay.write_protected = Some(false);
@@ -2754,6 +2801,9 @@ pub(crate) struct RawFloppyDrive {
     /// How hard to work at each track: careful, normal, fast, or turbo.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) flux_mode: Option<String>,
+    /// How to sense a disk being in the drive: probe, or pin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) flux_disk_change: Option<String>,
 }
 
 /// Convert a parsed `[ide]`/`[scsi]` drive entry into a `DriveImage`,
@@ -4313,18 +4363,29 @@ fn parse_floppy(raw: RawFloppy) -> Result<(FloppyConfig, [bool; 4], [Vec<PathBuf
                     )
                 })?,
             };
+            let disk_change = match raw_drive.flux_disk_change.as_deref() {
+                None => FluxDiskChange::default(),
+                Some(value) => FluxDiskChange::parse(value).ok_or_else(|| {
+                    anyhow!(
+                        "floppy.df{idx} flux_disk_change = \"{value}\" is not known; \
+                         expected \"probe\" or \"pin\""
+                    )
+                })?,
+            };
             flux[idx] = Some(FloppyFluxConfig {
                 interface,
                 write_protected: raw_drive.write_protected.unwrap_or(true),
                 port: raw_drive.flux_port.filter(|p| !p.trim().is_empty()),
                 cable,
                 mode,
+                disk_change,
             });
             continue;
         }
         if raw_drive.flux_port.is_some()
             || raw_drive.flux_cable.is_some()
             || raw_drive.flux_mode.is_some()
+            || raw_drive.flux_disk_change.is_some()
         {
             bail!(
                 "floppy.df{idx} configures a flux interface but has no \

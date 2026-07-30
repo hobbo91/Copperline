@@ -92,6 +92,16 @@ const ROTATION_HZ: u32 = 5;
 /// costs nothing and is far quicker than anyone can change a disk.
 #[cfg(feature = "fluxdrive")]
 const FLUX_STATUS_POLL_CCK: u64 = (PAULA_CLOCK_HZ / 4) as u64;
+
+/// How often to spin an apparently empty drive to see whether a disk has been
+/// put in, in emulated time.
+///
+/// This one costs a rotation and makes the spindle audible, so it is far slower
+/// than reading the status lines: a couple of seconds is quicker than anyone can
+/// close the drive door and reach the keyboard, and quiet enough not to sound
+/// like a fault.
+#[cfg(feature = "fluxdrive")]
+const FLUX_PROBE_INTERVAL_CCK: u64 = (PAULA_CLOCK_HZ * 2) as u64;
 // Turbo mode defers the burst completion of a freshly armed DMA by two
 // scanlines of emulated time (the same deferral WinUAE/FS-UAE apply to
 // their instant path): loaders commonly write DSKLEN and only then clear
@@ -1760,6 +1770,15 @@ impl FloppyController {
             }
             (flux.disk_present(), flux.write_protected())
         };
+        // Nothing has said there is a disk. Ask the drive directly, now and
+        // then: the guest will not spin a drive it believes is empty, so without
+        // this a disk put in while the machine is running is never noticed.
+        if sensed_media == Some(false) && elapsed >= drive.flux_probe_cck {
+            drive.flux_probe_cck = elapsed + FLUX_PROBE_INTERVAL_CCK;
+            if let Some(flux) = drive.flux.as_mut() {
+                flux.probe_for_disk();
+            }
+        }
         if let Some(present) = sensed_media {
             // A disk arriving or leaving is a change, and the guest is told the
             // same way it is told about an image being swapped.
@@ -1967,6 +1986,10 @@ struct FloppyDrive {
     flux_status_cck: u64,
     // Whether a disk was last sensed in the physical drive, so one going in or
     // coming out is noticed once rather than every poll.
+    // When an apparently empty drive is next worth spinning to check.
+    #[cfg(feature = "fluxdrive")]
+    #[serde(skip)]
+    flux_probe_cck: u64,
     #[cfg(feature = "fluxdrive")]
     #[serde(skip)]
     flux_media_seen: bool,
@@ -2014,6 +2037,8 @@ impl Default for FloppyDrive {
             flux_mode: crate::config::FluxMode::default(),
             #[cfg(feature = "fluxdrive")]
             flux_status_cck: 0,
+            #[cfg(feature = "fluxdrive")]
+            flux_probe_cck: 0,
             #[cfg(feature = "fluxdrive")]
             flux_media_seen: false,
             #[cfg(feature = "fluxdrive")]

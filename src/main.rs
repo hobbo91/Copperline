@@ -494,6 +494,14 @@ where
                 overrides.floppy_flux_mode[idx] = Some(mode);
             }
             #[cfg(feature = "fluxdrive")]
+            "--floppy-flux-disk-change" => {
+                const USAGE: &str = "--floppy-flux-disk-change requires DFN HOW \
+                                     (probe, or pin)";
+                let (drive_s, how) = two_values(&mut args, USAGE)?;
+                let idx = parse_floppy_drive_idx(&drive_s, "--floppy-flux-disk-change")?;
+                overrides.floppy_flux_disk_change[idx] = Some(how);
+            }
+            #[cfg(feature = "fluxdrive")]
             "--floppy-flux-writable" => {
                 const USAGE: &str = "--floppy-flux-writable requires DFN";
                 let drive_s = args.next().ok_or_else(|| anyhow!(USAGE))?;

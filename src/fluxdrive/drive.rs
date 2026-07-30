@@ -43,6 +43,8 @@ enum Command {
     },
     /// Read the drive's status lines.
     Status,
+    /// Try to read a little flux purely to find out whether a disk is in there.
+    Probe,
     Stop,
 }
 
@@ -60,6 +62,8 @@ pub struct CapturedTrack {
 enum Event {
     Captured(Box<CapturedTrack>),
     Status(super::DriveStatus),
+    /// Whether a probe found a disk in the drive.
+    Probed(bool),
     Failed {
         cylinder: u8,
         head: Head,
@@ -89,6 +93,9 @@ pub struct FluxDrive {
     write_protected: Option<bool>,
     /// A status read is outstanding, so another would only queue behind it.
     status_pending: bool,
+    probe_pending: bool,
+    /// Whether this drive's change line is worth reading for presence.
+    trust_change_pin: bool,
     /// The cylinder the real head was last sent to, so the guest's steps are
     /// forwarded once each rather than repeatedly.
     sent_cylinder: Option<u8>,
@@ -99,7 +106,11 @@ pub struct FluxDrive {
 
 impl FluxDrive {
     /// Take over a drive and put it on its own thread.
-    pub fn attach(mut source: Box<dyn FluxSource + Send>) -> Self {
+    pub fn attach(source: Box<dyn FluxSource + Send>, trust_change_pin: bool) -> Self {
+        Self::spawn(source, trust_change_pin)
+    }
+
+    fn spawn(mut source: Box<dyn FluxSource + Send>, trust_change_pin: bool) -> Self {
         let description = source.describe();
         let (commands, command_rx) = std::sync::mpsc::channel::<Command>();
         let (event_tx, events) = std::sync::mpsc::channel::<Event>();
@@ -112,6 +123,8 @@ impl FluxDrive {
         let worker = std::thread::Builder::new()
             .name("fluxdrive".to_string())
             .spawn(move || {
+                // The drive's own motor state, so a probe can put it back.
+                let mut motor_running = false;
                 while let Ok(command) = command_rx.recv() {
                     if worker_stopping.load(Ordering::Relaxed) {
                         break;
@@ -121,6 +134,8 @@ impl FluxDrive {
                         Command::Motor(on) => {
                             if let Err(err) = source.motor(on) {
                                 warn!("fluxdrive: cannot switch the drive motor: {err:#}");
+                            } else {
+                                motor_running = on;
                             }
                         }
                         Command::Seek(cylinder) => {
@@ -129,6 +144,23 @@ impl FluxDrive {
                             // believes is at the end stop quite deliberately.
                             if let Err(err) = source.seek(cylinder) {
                                 debug!("fluxdrive: cannot step to cylinder {cylinder}: {err:#}");
+                            }
+                        }
+                        Command::Probe => {
+                            // The only reliable way to tell: try to read, and
+                            // see whether an index pulse ever comes round. The
+                            // motor has to be turning for that, so spin it and
+                            // put it back as it was.
+                            let was_running = motor_running;
+                            if !was_running && source.motor(true).is_err() {
+                                continue;
+                            }
+                            let present = source.read_flux(1).is_ok();
+                            if !was_running {
+                                let _ = source.motor(false);
+                            }
+                            if event_tx.send(Event::Probed(present)).is_err() {
+                                break;
                             }
                         }
                         Command::Status => {
@@ -194,6 +226,8 @@ impl FluxDrive {
             disk_present: None,
             write_protected: None,
             status_pending: false,
+            probe_pending: false,
+            trust_change_pin,
             sent_cylinder: None,
             lost: false,
             stopping,
@@ -210,6 +244,22 @@ impl FluxDrive {
             return;
         }
         self.sent_cylinder = Some(cylinder);
+    }
+
+    /// Try to find out whether a disk is in the drive by reading a little of it.
+    ///
+    /// Costs a rotation and spins the spindle, so it is for when nothing else
+    /// can answer: the change line is a latch that reads "changed" for ever on
+    /// many drives, and the guest will not spin a drive it believes is empty.
+    pub fn probe_for_disk(&mut self) {
+        if self.lost || self.probe_pending || self.pending.is_some() {
+            return;
+        }
+        if self.commands.send(Command::Probe).is_err() {
+            self.lost = true;
+            return;
+        }
+        self.probe_pending = true;
     }
 
     /// Ask for the drive's status lines, unless a read is already outstanding.
@@ -307,10 +357,20 @@ impl FluxDrive {
                     self.disk_present = Some(true);
                     return Some(track);
                 }
+                Ok(Event::Probed(present)) => {
+                    self.probe_pending = false;
+                    self.disk_present = Some(present);
+                }
                 Ok(Event::Status(status)) => {
                     self.status_pending = false;
-                    if let Some(present) = status.disk_present {
-                        self.disk_present = Some(present);
+                    // The change line is a latch the drive only clears once the
+                    // head steps with a disk in place, so on many drives it
+                    // reads "changed" for ever and says nothing about presence.
+                    // Believed only when this drive is known to fit it.
+                    if self.trust_change_pin {
+                        if let Some(present) = status.disk_present {
+                            self.disk_present = Some(present);
+                        }
                     }
                     if let Some(protected) = status.write_protected {
                         self.write_protected = Some(protected);

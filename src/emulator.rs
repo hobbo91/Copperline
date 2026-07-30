@@ -1953,7 +1953,8 @@ fn attach_flux_drives(floppy: &mut FloppyController, cfg: &Config) -> Result<()>
                     .with_context(|| format!("floppy.df{idx}: cannot open the physical drive"))?
             }
         };
-        let drive = FluxDrive::attach(Box::new(source));
+        let trust_change_pin = flux_cfg.disk_change == crate::config::FluxDiskChange::Pin;
+        let drive = FluxDrive::attach(Box::new(source), trust_change_pin);
         info!(
             "floppy.df{idx} physical drive attached: {}",
             drive.describe()
@@ -1965,9 +1966,11 @@ fn attach_flux_drives(floppy: &mut FloppyController, cfg: &Config) -> Result<()>
             );
         }
         info!(
-            "floppy.df{idx} reading {} revolutions of each track ({} mode)",
+            "floppy.df{idx} reading {} revolutions of each track ({} mode), \
+             sensing the disk by {}",
             flux_cfg.mode.revolutions(),
             flux_cfg.mode.label(),
+            flux_cfg.disk_change.label(),
         );
         floppy.attach_flux_drive(idx, drive, flux_cfg.write_protected, flux_cfg.mode)?;
     }

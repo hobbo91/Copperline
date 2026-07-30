@@ -388,7 +388,8 @@ fn watch_the_drive_status_lines() {
             println!("[{:5.1}s] {line}", start.elapsed().as_secs_f64());
             last = line;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Slow: this only watches, and hammering the interface teaches nothing.
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
     println!("\ndone");
 }
