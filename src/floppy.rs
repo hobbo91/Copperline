@@ -198,6 +198,11 @@ fn disk_speed_div() -> Option<(u32, f64)> {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct FloppyController {
+    /// Emulated time accumulated for watching physical drives, which has to run
+    /// whether or not the machine is touching them.
+    #[cfg(feature = "fluxdrive")]
+    #[serde(skip)]
+    flux_watch_cck: u64,
     /// Debugger: watched word addresses and the last disk-DMA write to
     /// one of them, for watchpoint writer attribution. Transient.
     #[serde(skip)]
@@ -273,6 +278,8 @@ impl Default for FloppyController {
             drive.external_id = 0;
         }
         Self {
+            #[cfg(feature = "fluxdrive")]
+            flux_watch_cck: 0,
             debug_watch_addrs: Vec::new(),
             debug_watched_write: None,
             drives,
@@ -724,20 +731,25 @@ impl FloppyController {
                         self.sound_steps = self.sound_steps.saturating_add(1);
                     }
                 }
-                // Send the real head after the emulated one, a step for a step.
+                // Pass the step pulse itself to a drive with nothing in it.
                 //
-                // This is not only about position. `/DSKCHG` is a latch the drive
-                // clears when the head steps with a disk in place, so the guest's
-                // stepping is what tells a loaded drive from an empty one -- and
-                // it is why an Amiga clicks away at a drive with nothing in it:
-                // the latch never clears, so trackdisk keeps testing it. The
-                // click and the detection are the same act, and both belong to
-                // the guest, which is why nothing here manufactures either.
+                // `/DSKCHG` is a latch the drive resets on the step line's
+                // electrical edge -- whether or not the carriage moves, which at
+                // the end stop it does not. That reset is how a disk being put in
+                // is ever noticed, and the guest's polling is what performs it,
+                // so the pulse has to reach the drive even though the head stays
+                // put. It moves nothing, so it cannot disturb a read.
+                //
+                // Head *position* is deliberately not sent from here. The guest
+                // steps every 3 ms and a command over USB cannot, so chasing its
+                // intermediate positions leaves the real head lagging through a
+                // seek the emulated one has finished -- heard as a grind rather
+                // than one clean sweep. Position belongs to the capture, which
+                // moves the head once, to where the track actually is.
                 #[cfg(feature = "fluxdrive")]
-                {
-                    let cylinder = self.drives[idx].cylinder;
+                if !self.drives[idx].has_media() {
                     if let Some(flux) = self.drives[idx].flux.as_mut() {
-                        flux.seek(cylinder);
+                        flux.step_pulse();
                     }
                 }
             }
@@ -978,6 +990,15 @@ impl FloppyController {
     /// behind `COPPERLINE_DIAG_DISK` at DMA start), so it can be skipped
     /// entirely. Spans most of the time an Amiga spends not using the disk.
     fn is_idle(&self) -> bool {
+        // A real drive is never something the controller can stop attending to.
+        // `/CHNG` and `/WRPROT` are lines the machine may read at any moment, and
+        // a disk can be put in or taken out while the guest is doing nothing at
+        // all -- so unlike an image, which changes only when told, a physical bay
+        // has to keep being watched.
+        #[cfg(feature = "fluxdrive")]
+        if self.has_flux_drive() {
+            return false;
+        }
         self.dma.is_none()
             && self.direct_write.is_none()
             && self.index_pulse_cck == 0
@@ -994,6 +1015,12 @@ impl FloppyController {
     }
 
     pub fn tick(&mut self, cck: u32, dmacon: u16, chip_ram: &mut [u8]) -> bool {
+        // Before anything else, and whatever the machine is or is not doing: a
+        // real drive's lines have to be watched. A disk can go in or come out
+        // while the guest is idle, and it never selects a drive it believes is
+        // empty, so waiting to be asked would mean never finding out.
+        #[cfg(feature = "fluxdrive")]
+        self.watch_flux_drives(cck);
         self.idle_cache = self.is_idle();
         if self.idle_cache {
             return false;
@@ -1730,6 +1757,80 @@ impl FloppyController {
         }
     }
 
+    /// Read every physical drive's status lines, and notice a disk coming or
+    /// going.
+    ///
+    /// Runs on its own clock, independent of what the emulated machine is doing,
+    /// because that is what the lines themselves are: `/CHNG` and `/WRPROT` sit
+    /// there to be read whenever the machine cares to look, and the disk they
+    /// describe can be swapped while it is looking nowhere at all.
+    #[cfg(feature = "fluxdrive")]
+    fn watch_flux_drives(&mut self, cck: u32) {
+        self.flux_watch_cck = self.flux_watch_cck.saturating_add(u64::from(cck));
+        let now = self.flux_watch_cck;
+        for idx in 0..self.drives.len() {
+            let drive = &mut self.drives[idx];
+            if drive.flux.is_none() {
+                continue;
+            }
+            let due_status = now >= drive.flux_status_cck;
+            if due_status {
+                drive.flux_status_cck = now + FLUX_STATUS_POLL_CCK;
+            }
+            let due_probe = now >= drive.flux_probe_cck;
+
+            let (sensed_media, sensed_tab) = {
+                let Some(flux) = drive.flux.as_mut() else {
+                    continue;
+                };
+                if due_status {
+                    flux.request_status();
+                }
+                (flux.disk_present(), flux.write_protected())
+            };
+
+            // The change line says an empty slot and a just-swapped disk with the
+            // same signal, so when it reports nothing there, ask the disk itself
+            // now and then. The guest will not spin a drive it believes is empty,
+            // which would otherwise leave a disk put in while it runs unnoticed.
+            if sensed_media == Some(false) && due_probe {
+                drive.flux_probe_cck = now + FLUX_PROBE_INTERVAL_CCK;
+                if let Some(flux) = drive.flux.as_mut() {
+                    flux.probe_for_disk();
+                }
+            }
+
+            if let Some(present) = sensed_media {
+                // A disk arriving or leaving is a change, told to the guest the
+                // same way an image being swapped is. Everything read off the old
+                // disk goes with it: serving a cached track from a disk that has
+                // left is the one thing a real drive cannot do.
+                if present != drive.flux_media_seen {
+                    drive.flux_media_seen = present;
+                    drive.set_disk_change(true);
+                    drive.flux_tracks.clear();
+                    drive.flux_filler_track = None;
+                    drive.cached = CachedTrack::default();
+                    drive.cached_track = None;
+                    log::info!(
+                        "floppy.df{idx} {}",
+                        if present {
+                            "disk in the physical drive"
+                        } else {
+                            "no disk in the physical drive"
+                        }
+                    );
+                }
+            }
+            if let Some(protected) = sensed_tab {
+                // Either the configuration or the disk's own tab is enough to
+                // protect it, and neither overrides the other.
+                let effective = drive.flux_write_protected || protected;
+                drive.set_write_protected(effective);
+            }
+        }
+    }
+
     /// Put the track under the head on the platter, reading it off the real disk
     /// if it is not already known.
     ///
@@ -1747,61 +1848,8 @@ impl FloppyController {
         // select alone gets here with the motor still off.
         let at_speed = drive.motor_on && drive.motor_cck >= MOTOR_READY_CCK;
         let motor_on = drive.motor_on;
-        let elapsed = drive.elapsed_cck;
-        let due_status = elapsed >= drive.flux_status_cck;
-        if due_status {
-            drive.flux_status_cck = elapsed + FLUX_STATUS_POLL_CCK;
-        }
-
-        // Watch the drive's own lines for a disk going in or coming out, and for
-        // the tab. Nothing tells the emulator otherwise: unlike an image, nobody
-        // announces a change to a real drive.
-        let (sensed_media, sensed_tab) = {
-            let Some(flux) = drive.flux.as_mut() else {
-                return;
-            };
+        if let Some(flux) = drive.flux.as_mut() {
             flux.set_motor(motor_on);
-            if due_status {
-                flux.request_status();
-            }
-            (flux.disk_present(), flux.write_protected())
-        };
-        // Nothing has said there is a disk. Ask the drive directly, now and
-        // then: the guest will not spin a drive it believes is empty, so without
-        // this a disk put in while the machine is running is never noticed.
-        if sensed_media == Some(false) && elapsed >= drive.flux_probe_cck {
-            drive.flux_probe_cck = elapsed + FLUX_PROBE_INTERVAL_CCK;
-            if let Some(flux) = drive.flux.as_mut() {
-                flux.probe_for_disk();
-            }
-        }
-        if let Some(present) = sensed_media {
-            // A disk arriving or leaving is a change, and the guest is told the
-            // same way it is told about an image being swapped. Everything read
-            // off the old disk goes with it: serving a cached track from a disk
-            // that has left the building is the one thing a real drive cannot do.
-            if present != drive.flux_media_seen {
-                drive.flux_media_seen = present;
-                drive.set_disk_change(true);
-                drive.flux_tracks.clear();
-                drive.flux_filler_track = None;
-                drive.cached = CachedTrack::default();
-                drive.cached_track = None;
-                log::info!(
-                    "floppy.df{idx} {}",
-                    if present {
-                        "disk in the physical drive"
-                    } else {
-                        "no disk in the physical drive"
-                    }
-                );
-            }
-        }
-        if let Some(protected) = sensed_tab {
-            // Either the configuration or the disk's own tab is enough to
-            // protect it, and neither overrides the other.
-            let effective = drive.flux_write_protected || protected;
-            drive.set_write_protected(effective);
         }
 
         let Some(flux) = drive.flux.as_mut() else {
