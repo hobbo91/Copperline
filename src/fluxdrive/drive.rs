@@ -21,7 +21,7 @@ use super::cells::{recover_cells, RecoveredTrack};
 use super::{FluxSource, Head};
 use anyhow::{anyhow, Result};
 use log::{debug, warn};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -29,15 +29,14 @@ use std::thread::JoinHandle;
 /// What the emulated side asks the drive to do.
 enum Command {
     Motor(bool),
-    /// The guest has moved its head; go to wherever it is now.
+    /// The guest has stepped its head to this cylinder; follow it there.
     ///
-    /// Carries no cylinder of its own on purpose. The guest steps every 3 ms and
-    /// a command over USB cannot, so a queue of these would replay its whole
-    /// journey -- dragging the real head cylinder by cylinder through a seek the
-    /// emulated one finished long ago, and starving whatever wanted to read. The
-    /// destination is read fresh from `target_cylinder` when the command is
-    /// acted on, so a backlog collapses into one move to where the head belongs.
-    Seek,
+    /// Sent only while the drive is empty, where the guest steps a track in and
+    /// out about once a second to poll for a disk. Each is carried out as asked,
+    /// because each is a click: collapsing a pair into "where the head ended up"
+    /// loses the movement between them, and with it the sound. There is nothing
+    /// to starve, since a drive with no disk in it has nothing to read.
+    Seek(u8),
     Capture {
         cylinder: u8,
         head: Head,
@@ -104,9 +103,6 @@ pub struct FluxDrive {
     /// Set when the thread has gone, so the bay can stop asking.
     lost: bool,
     stopping: Arc<AtomicBool>,
-    /// Where the guest's head is, read by the drive's thread when it gets round
-    /// to moving. Shared rather than queued so a backlog cannot replay a seek.
-    target_cylinder: Arc<AtomicU8>,
 }
 
 impl FluxDrive {
@@ -124,9 +120,6 @@ impl FluxDrive {
         // asked for first.
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = Arc::clone(&stopping);
-        // Where the guest's head is now, which is all the drive needs to know.
-        let target_cylinder = Arc::new(AtomicU8::new(0));
-        let worker_target = Arc::clone(&target_cylinder);
 
         let worker = std::thread::Builder::new()
             .name("fluxdrive".to_string())
@@ -146,8 +139,7 @@ impl FluxDrive {
                                 motor_running = on;
                             }
                         }
-                        Command::Seek => {
-                            let cylinder = worker_target.load(Ordering::Relaxed);
+                        Command::Seek(cylinder) => {
                             // A step that will not go through is not worth
                             // reporting every time: the guest steps a drive it
                             // believes is at the end stop quite deliberately.
@@ -240,7 +232,6 @@ impl FluxDrive {
             sent_cylinder: None,
             lost: false,
             stopping,
-            target_cylinder,
         }
     }
 
@@ -249,11 +240,10 @@ impl FluxDrive {
         if self.lost {
             return;
         }
-        self.target_cylinder.store(cylinder, Ordering::Relaxed);
         if self.sent_cylinder == Some(cylinder) {
             return;
         }
-        if self.commands.send(Command::Seek).is_err() {
+        if self.commands.send(Command::Seek(cylinder)).is_err() {
             self.lost = true;
             return;
         }
@@ -349,7 +339,6 @@ impl FluxDrive {
         }
         // The capture seeks on the drive's thread, so record where that leaves
         // the head or the next step would be thought already sent.
-        self.target_cylinder.store(cylinder, Ordering::Relaxed);
         self.sent_cylinder = Some(cylinder);
         self.pending = Some((cylinder, head));
         true
@@ -384,23 +373,16 @@ impl FluxDrive {
                 }
                 Ok(Event::Status(status)) => {
                     self.status_pending = false;
-                    // The change line does not say "empty": it says *something
-                    // happened*. The drive asserts it when a disk leaves and
-                    // clears it once the head steps with one back in, so an
-                    // asserted line covers an empty slot and a disk just put in
-                    // equally well. Taking it for absence makes presence flap
-                    // every time a disk is touched.
-                    //
-                    // So a cleared line is believed -- there is certainly a disk
-                    // in there -- and an asserted one only unsettles what was
-                    // known, leaving the probe to say which of the two it is.
+                    // Believed as it stands, both ways. A disk leaving asserts
+                    // the line at once, and an Amiga acts on that immediately --
+                    // waiting to be sure would put a pause between the disk
+                    // coming out and the drive starting to click, which is not
+                    // what the machine does. A disk going in is resolved by the
+                    // guest's own polling: its steps clear the latch, and the
+                    // probe is there for a drive that never clears it.
                     if self.trust_change_pin {
-                        match status.disk_present {
-                            Some(true) => self.disk_present = Some(true),
-                            Some(false) if self.disk_present == Some(true) => {
-                                self.disk_present = None;
-                            }
-                            _ => {}
+                        if let Some(present) = status.disk_present {
+                            self.disk_present = Some(present);
                         }
                     }
                     if let Some(protected) = status.write_protected {

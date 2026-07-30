@@ -1100,8 +1100,13 @@ impl FluxMode {
     }
 
     /// Whether to read the other side of a cylinder while the head is there.
+    ///
+    /// On for everything but the most cautious setting. It costs no head
+    /// movement and fetches what a disk being read in order asks for next, so
+    /// the only reason to decline is wanting the drive to do nothing it was not
+    /// asked to.
     pub fn reads_ahead(self) -> bool {
-        matches!(self, Self::Turbo)
+        !matches!(self, Self::Careful)
     }
 
     /// Whole revolutions to capture per track.

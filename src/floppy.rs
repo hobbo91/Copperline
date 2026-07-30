@@ -1905,6 +1905,7 @@ impl FloppyController {
         let cylinder = (track / SIDES) as u8;
         let head = crate::fluxdrive::Head::from_index(u8::from(!track.is_multiple_of(SIDES)));
         let revolutions = self.drives[idx].flux_mode.revolutions();
+        let read_ahead = self.drives[idx].flux_mode.reads_ahead();
         let drive = &mut self.drives[idx];
 
         // A real drive reads nothing until the platter is at speed, and drive
@@ -1937,6 +1938,34 @@ impl FloppyController {
                 drive.cached_track = Some(track);
                 drive.flux_filler_track = None;
                 drive.clamp_head();
+            }
+            // Nothing to fetch, so fetch what is almost certainly wanted next.
+            // AmigaDOS works through a disk in track order, which is both sides
+            // of a cylinder before moving on -- and the other side is a line to
+            // select, not a seek, so it costs a rotation and no head movement.
+            // Doing it while the guest chews on this track is the difference
+            // between waiting for every track and waiting for every other one.
+            if read_ahead {
+                let sibling = track ^ 1;
+                let unknown = drive
+                    .flux_tracks
+                    .get(sibling)
+                    .and_then(Option::as_ref)
+                    .is_none();
+                if unknown {
+                    let other = crate::fluxdrive::Head::from_index(u8::from(
+                        !sibling.is_multiple_of(SIDES),
+                    ));
+                    if let Some(flux) = drive.flux.as_mut() {
+                        if flux.request(cylinder, other, revolutions) {
+                            debug!(
+                                "floppy.df{idx} flux: reading ahead on track {sibling} \
+                                 (cyl {cylinder} head {})",
+                                other.index()
+                            );
+                        }
+                    }
+                }
             }
             return;
         }
