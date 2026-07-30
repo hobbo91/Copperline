@@ -288,6 +288,8 @@ pub struct Greaseweazle {
     /// When the head last actually moved, so a read can wait out the carriage
     /// settling however the move came about.
     moved_at: Option<Instant>,
+    /// Whether to confirm the head landed where it was sent.
+    verify_head: bool,
 }
 
 /// Serial ports that look like a Greaseweazle, most likely first.
@@ -422,6 +424,7 @@ impl Greaseweazle {
             head: Head::Lower,
             motor_on: false,
             moved_at: None,
+            verify_head: true,
         };
 
         gw.clear_comms()?;
@@ -475,6 +478,16 @@ impl Greaseweazle {
         }
 
         Ok(gw)
+    }
+
+    /// Whether to confirm against `/TRK0` that the head is where it was sent.
+    ///
+    /// Costs a couple of exchanges with the interface on every seek. Worth it
+    /// almost always -- a step count is only ever a count, and a head that is not
+    /// where it is believed to be reads the wrong track -- but it is one of the
+    /// few things left to give up when speed is all that is wanted.
+    pub fn set_verify_head(&mut self, verify: bool) {
+        self.verify_head = verify;
     }
 
     pub fn firmware(&self) -> &FirmwareInfo {
@@ -798,6 +811,11 @@ impl FluxSource for Greaseweazle {
         // believed to be, every later position is wrong too. `/TRK0` is the one
         // place that can be checked, so check it whenever the head is there or
         // claims not to be.
+        if !self.verify_head {
+            self.cylinder = Some(cylinder);
+            self.moved_at = Some(Instant::now());
+            return Ok(());
+        }
         let at_track0 = self.at_track0()?;
         if at_track0 != (cylinder == 0) {
             // Some flippy-modified drives do not assert /TRK0 when stepping

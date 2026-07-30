@@ -1058,41 +1058,41 @@ impl FluxInterface {
 /// revolutions means a slower read that fails less often.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FluxMode {
-    /// Five revolutions. For reading a disk that is failing, or archiving one
-    /// where a second attempt is not wanted.
-    Careful,
-    /// Three revolutions, for a disk that is giving trouble without being bad
-    /// enough to want the careful setting.
-    Thorough,
-    /// Two revolutions: one reading to use and one to fall back on, which is
-    /// what a healthy disk needs and no more.
+    /// Five readings of every track, and nothing fetched that was not asked
+    /// for. For a disk that is failing, or one being read once and carefully.
+    Slowest,
+    /// Three readings. For a disk giving trouble without being bad enough to
+    /// want the slowest setting.
+    Slow,
+    /// Two readings: one to use and one to fall back on, which is what a healthy
+    /// disk needs and no more.
     #[default]
     Normal,
-    /// One revolution -- as fast as the disk can be read at all. A sector the
-    /// head mis-reads has no second reading behind it, so the guest waits for
-    /// the track to be captured again.
+    /// One reading. As fast as a disk can be read at all, and enough for a disk
+    /// in good order -- but a sector the head mis-reads has no second reading
+    /// behind it, so the guest waits for the track to be fetched again.
     Fast,
-    /// As `fast`, and reads the other side of a cylinder while the head is
-    /// already there, since AmigaDOS works through tracks in pairs.
+    /// One reading, and no verifying that the head is where it is believed to
+    /// be. Everything that can be given up has been.
     Turbo,
 }
 
 impl FluxMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "careful" | "slow" => Some(Self::Careful),
-            "thorough" => Some(Self::Thorough),
-            "normal" => Some(Self::Normal),
-            "fast" => Some(Self::Fast),
-            "turbo" => Some(Self::Turbo),
+            "slowest" | "0" | "careful" => Some(Self::Slowest),
+            "slow" | "1" | "thorough" => Some(Self::Slow),
+            "normal" | "2" => Some(Self::Normal),
+            "fast" | "3" => Some(Self::Fast),
+            "turbo" | "4" => Some(Self::Turbo),
             _ => None,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Careful => "careful",
-            Self::Thorough => "thorough",
+            Self::Slowest => "slowest",
+            Self::Slow => "slow",
             Self::Normal => "normal",
             Self::Fast => "fast",
             Self::Turbo => "turbo",
@@ -1106,14 +1106,23 @@ impl FluxMode {
     /// the only reason to decline is wanting the drive to do nothing it was not
     /// asked to.
     pub fn reads_ahead(self) -> bool {
-        !matches!(self, Self::Careful)
+        !matches!(self, Self::Slowest)
+    }
+
+    /// Whether to check the head is where it is believed to be after a seek.
+    ///
+    /// `/TRK0` is the one position on a disk that can be established rather than
+    /// counted to, so it is worth a couple of exchanges with the interface to
+    /// confirm -- except at the very top, where speed is the whole point.
+    pub fn verifies_head(self) -> bool {
+        !matches!(self, Self::Turbo)
     }
 
     /// Whole revolutions to capture per track.
     pub fn revolutions(self) -> u8 {
         match self {
-            Self::Careful => 5,
-            Self::Thorough => 3,
+            Self::Slowest => 5,
+            Self::Slow => 3,
             Self::Normal => 2,
             Self::Fast => 1,
             Self::Turbo => 1,
@@ -4370,7 +4379,7 @@ fn parse_floppy(raw: RawFloppy) -> Result<(FloppyConfig, [bool; 4], [Vec<PathBuf
                 Some(value) => FluxMode::parse(value).ok_or_else(|| {
                     anyhow!(
                         "floppy.df{idx} flux_mode = \"{value}\" is not a known mode; \
-                         expected \"careful\", \"thorough\", \"normal\", \"fast\", or \"turbo\""
+                         expected \"slowest\", \"slow\", \"normal\", \"fast\", or \"turbo\" (or 0 to 4)"
                     )
                 })?,
             };

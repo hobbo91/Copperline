@@ -450,3 +450,56 @@ fn a_cold_spin_up_needs_time_before_reading() {
     }
     drive.motor(false).expect("stop the motor");
 }
+
+/// Where the time in a track read actually goes.
+///
+/// A revolution is 200 ms and nothing can make it shorter, so anything else is
+/// worth knowing about: the seek, the wait for an index, moving the flux over
+/// USB, and recovering cells from it.
+#[test]
+#[ignore = "requires a flux interface with a disk in the drive"]
+fn time_the_parts_of_a_track_read() {
+    use std::time::Instant;
+    let mut drive = open_drive();
+    println!("{}", drive.describe());
+    drive.motor(true).expect("spin up");
+    // Settle the spindle before timing anything.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    for revolutions in [1u8, 2, 3] {
+        let mut seek_ms = 0.0;
+        let mut read_ms = 0.0;
+        let mut decode_ms = 0.0;
+        let passes = 8;
+        for pass in 0..passes {
+            // Alternate cylinders so each pass pays a real one-track seek.
+            let cylinder = 20 + (pass % 2) as u8;
+            let t = Instant::now();
+            drive.seek(cylinder).expect("seek");
+            drive.select_head(Head::Lower).expect("head");
+            seek_ms += t.elapsed().as_secs_f64() * 1e3;
+
+            let t = Instant::now();
+            let capture = drive.read_flux(revolutions).expect("read");
+            read_ms += t.elapsed().as_secs_f64() * 1e3;
+
+            let t = Instant::now();
+            for rev in 0..capture.revolutions() {
+                let r = capture.revolution(rev).expect("revolution");
+                recover_cells(&r, capture.ticks_per_sec).expect("cells");
+            }
+            decode_ms += t.elapsed().as_secs_f64() * 1e3;
+        }
+        let n = f64::from(passes);
+        println!(
+            "  {revolutions} rev: seek {:.0} ms + read {:.0} ms + decode {:.0} ms = {:.0} ms \
+             (a revolution is 200 ms, so {:.0} ms is not the disk)",
+            seek_ms / n,
+            read_ms / n,
+            decode_ms / n,
+            (seek_ms + read_ms + decode_ms) / n,
+            (seek_ms + read_ms + decode_ms) / n - 200.0 * f64::from(revolutions),
+        );
+    }
+    drive.motor(false).expect("spin down");
+}

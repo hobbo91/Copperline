@@ -1935,9 +1935,25 @@ impl FloppyController {
         // and the only reason a re-read is worth anything.
         if let Some(known) = drive.flux_tracks.get(track).and_then(Option::as_ref) {
             if drive.cached_track != Some(track) {
+                // Flux just fetched ends at an index pulse: that is where the
+                // real head was when the drive stopped reading, so that is where
+                // the emulated one goes. Left wherever the filler had turned to,
+                // the guest lands at a random point in the track and waits for
+                // its sync word to come round -- most of a revolution, on every
+                // track, spent on nothing.
+                //
+                // Only for flux the guest was waiting on. Returning to a track
+                // read earlier is different: the platter never stopped, so the
+                // position it has turned to is real and worth keeping.
+                let just_fetched = drive.flux_filler_track == Some(track);
                 drive.cached = known.clone();
                 drive.cached_track = Some(track);
                 drive.flux_filler_track = None;
+                if just_fetched {
+                    drive.rotation_rev = 0;
+                    drive.rotation_bit = 0;
+                    drive.rotation_acc_cck = 0;
+                }
                 drive.clamp_head();
             }
             // Nothing to fetch, so fetch what is almost certainly wanted next.

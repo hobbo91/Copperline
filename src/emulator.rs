@@ -1949,8 +1949,10 @@ fn attach_flux_drives(floppy: &mut FloppyController, cfg: &Config) -> Result<()>
                 let select = DriveSelect::parse(&flux_cfg.cable).with_context(|| {
                     format!("floppy.df{idx}: {} is not a drive position", flux_cfg.cable)
                 })?;
-                Greaseweazle::open(flux_cfg.port.as_deref(), select)
-                    .with_context(|| format!("floppy.df{idx}: cannot open the physical drive"))?
+                let mut gw = Greaseweazle::open(flux_cfg.port.as_deref(), select)
+                    .with_context(|| format!("floppy.df{idx}: cannot open the physical drive"))?;
+                gw.set_verify_head(flux_cfg.mode.verifies_head());
+                gw
             }
         };
         let trust_change_pin = flux_cfg.disk_change == crate::config::FluxDiskChange::Pin;
