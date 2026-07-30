@@ -1064,24 +1064,33 @@ pub enum FluxMode {
     /// Three readings. For a disk giving trouble without being bad enough to
     /// want the slowest setting.
     Slow,
-    /// Two readings: one to use and one to fall back on, which is what a healthy
-    /// disk needs and no more.
+    /// Two readings: one to use and one to fall back on. A sector the head
+    /// mis-reads on the way past is very often clean on the next turn, and the
+    /// guest recovers it by re-reading, which is what the second reading is for.
     #[default]
     Normal,
-    /// One reading. As fast as a disk can be read at all, and enough for a disk
-    /// in good order -- but a sector the head mis-reads has no second reading
-    /// behind it, so the guest waits for the track to be fetched again.
+    /// One reading -- as few as a track can be fetched in.
+    ///
+    /// Enough for a disk in good order, and a third quicker than `normal`. What
+    /// it gives up is the fallback: a sector the head mis-reads has no second
+    /// reading behind it, so the guest's re-read meets the same cells again and
+    /// the track fails. A disk that is at all marginal wants `normal`.
     Fast,
-    /// One reading, and no verifying that the head is where it is believed to
-    /// be. Everything that can be given up has been.
+    /// One reading, and the head no longer checked against `/TRK0` after a seek.
+    ///
+    /// Barely quicker than `fast` -- the check is a couple of milliseconds a
+    /// track -- because with one reading there is almost nothing left to give
+    /// up. What it costs is the only guard there is against the head not being
+    /// where it is believed to be, and a head one cylinder out reads a whole
+    /// track of the wrong thing without anything noticing.
     Turbo,
 }
 
 impl FluxMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "slowest" | "0" | "careful" => Some(Self::Slowest),
-            "slow" | "1" | "thorough" => Some(Self::Slow),
+            "slowest" | "0" => Some(Self::Slowest),
+            "slow" | "1" => Some(Self::Slow),
             "normal" | "2" => Some(Self::Normal),
             "fast" | "3" => Some(Self::Fast),
             "turbo" | "4" => Some(Self::Turbo),
@@ -1099,16 +1108,25 @@ impl FluxMode {
         }
     }
 
-    /// Whether to check the head is where it is believed to be after a seek.
+    /// Whether to confirm against `/TRK0` that the head is where it was sent.
     ///
-    /// `/TRK0` is the one position on a disk that can be established rather than
-    /// counted to, so it is worth a couple of exchanges with the interface to
-    /// confirm -- except at the very top, where speed is the whole point.
+    /// A step count is only ever a count: once the head is not where it is
+    /// believed to be, every position after it is wrong too, and tracks come
+    /// back full of the wrong cylinder's data. `/TRK0` is the one position that
+    /// can be established rather than counted to, which is what makes it worth
+    /// a couple of exchanges with the interface on every seek.
     pub fn verifies_head(self) -> bool {
         !matches!(self, Self::Turbo)
     }
 
-    /// Whole revolutions to capture per track.
+    /// Whole readings to take of a track at once.
+    ///
+    /// The only thing that meaningfully sets how long a track takes. Measured on
+    /// the interface, a fetch costs a flat 200 ms plus 200 ms a reading: the flat
+    /// part is waiting for an index pulse, which a read cannot start without and
+    /// which cannot be avoided, since a read ends at one and the next begins just
+    /// past it. Everything else -- the seek, recovering cells -- is a couple of
+    /// milliseconds together.
     pub fn revolutions(self) -> u8 {
         match self {
             Self::Slowest => 5,
@@ -1122,42 +1140,37 @@ impl FluxMode {
 
 /// How to tell whether a disk is in a physical drive.
 ///
-/// The floppy bus has no line that simply says so. What it has is `/DSKCHG`, a
-/// latch the drive asserts when a disk is taken out and clears only once the
-/// head steps with one back in -- so on a drive that does not fit the line, or
-/// has not stepped since, it reads "changed" indefinitely and says nothing.
+/// The bus has no line that simply says so. What it has is `/DSKCHG`, a latch
+/// the drive asserts when a disk is taken out and clears once the head steps
+/// with one back in -- so it reads "no disk" until something steps. What steps
+/// is the guest, polling an empty drive a track in and out about once a second,
+/// which is also the click a real Amiga makes. The poll and the answer are the
+/// same act.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FluxDiskChange {
-    /// Read `/DSKCHG`, which is what an Amiga does.
-    ///
-    /// The line is a latch: the drive asserts it when a disk is taken out and
-    /// clears it once the head steps with one back in. So it reads "no disk"
-    /// until something steps -- and what steps is the guest, polling an empty
-    /// drive a track in and out about once a second. That poll is the click, and
-    /// resolving this line is what it is for: a machine started with a disk in
-    /// clicks once or twice, the latch clears, and the disk is found. Which is
-    /// exactly what a real Amiga does.
+    /// Read `/DSKCHG`, as an Amiga does. Costs nothing and answers at once.
     #[default]
     Pin,
     /// Find out by reading a little of the disk instead: no index pulse coming
-    /// round means nothing is turning, so the slot is empty. Spins the spindle to
-    /// ask, but does not need the drive to drive its change line at all.
+    /// round means nothing is turning, so the slot is empty. Spins the spindle
+    /// to ask, and holds the drive while it does, but needs no working change
+    /// line at all.
     Probe,
 }
 
 impl FluxDiskChange {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "probe" | "index" => Some(Self::Probe),
             "pin" | "dskchg" => Some(Self::Pin),
+            "probe" | "index" => Some(Self::Probe),
             _ => None,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Probe => "probe",
             Self::Pin => "pin",
+            Self::Probe => "probe",
         }
     }
 }
