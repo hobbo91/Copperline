@@ -36,6 +36,11 @@ pub mod emulator;
 pub mod envcfg;
 pub mod filesys;
 pub mod floppy;
+// Physical 3.5" drives at flux level, through a USB flux interface. Gated
+// because it needs a host serial port, which a wasm32 browser build cannot
+// open.
+#[cfg(feature = "fluxdrive")]
+pub mod fluxdrive;
 #[cfg(feature = "frontend")]
 pub mod gamepad;
 pub mod gary;

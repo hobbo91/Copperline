@@ -23,6 +23,7 @@ default = [
     "ctl-bin",
     "net-nat",
     "net-bridge",
+    "fluxdrive",
 ]
 display-plan-trace = []
 # Local investigation switches that deliberately alter timing or rendering.
@@ -73,6 +74,12 @@ net-nat = ["dep:smoltcp"]
 net-bridge = ["dep:pcap", "dep:libloading"]
 # The `copperline-ctl` command-line client for the control protocol.
 ctl-bin = ["dep:serde_json"]
+# Physical 3.5" drives at flux level (src/fluxdrive/): a floppy bay reads
+# magnetic flux transitions off a real disk through a USB interface and
+# recovers MFM cells in Copperline's own data separator, the way Paula
+# recovers them from /RDATA. Needs a host serial port, which a wasm32
+# browser build has no way to open, so browser builds compile it out.
+fluxdrive = ["dep:serialport"]
 
 [dependencies]
 # Path-only dependency on the in-tree fork (crates/m68k). No version requirement
@@ -127,6 +134,12 @@ smoltcp = { version = "0.12", default-features = false, features = [
 # optional realtime-priority feature (see src/priority.rs).
 libc = "0.2"
 zerocopy = { version = "0.8", features = ["derive"] }
+# Host serial port for flux-level floppy interfaces (src/fluxdrive/). The
+# interfaces enumerate as USB CDC devices, so this is the whole transport.
+# Default features off on purpose: they pull libudev for port enumeration on
+# Linux, which would put a system package in the build's way. Without it,
+# enumeration reads sysfs directly, which is all a CDC device needs.
+serialport = { version = "4", default-features = false, optional = true }
 
 # macOS dock icon: winit's with_window_icon is a no-op on macOS, so the dock
 # icon must be set at runtime via NSApplication. These objc2 versions match the
