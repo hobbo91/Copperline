@@ -846,7 +846,7 @@ impl std::fmt::Debug for Greaseweazle {
 ///
 /// A trailing zero byte ends the stream.
 pub fn decode_flux_stream(stream: &[u8], ticks_per_sec: u32) -> Result<FluxCapture> {
-    let Some((&terminator, body)) = stream.split_last().map(|(last, body)| (last, body)) else {
+    let Some((&terminator, body)) = stream.split_last() else {
         bail!("empty flux stream");
     };
     ensure!(

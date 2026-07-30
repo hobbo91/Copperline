@@ -150,15 +150,15 @@ const SCP_300_RPM_REV_NS: u64 = 200_000_000;
 const SCP_360_RPM_REV_NS: u64 = 166_666_667;
 const SCP_CHECKSUM_OFFSET: usize = 0x0C;
 const SCP_CHECKSUM_START: usize = 0x10;
-const MAX_SCP_REVOLUTION_BITS: u32 = 1_000_000;
+const MAX_FLUX_REVOLUTION_BITS: u32 = 1_000_000;
 // Flux-decode PLL (data separator): how strongly the recovered bit-cell window
 // tracks the measured per-cell interval, and the range it may drift within.
 // Real DD disks spin near 2 us/cell but vary a few percent across a track;
 // locking the window to the local flux rate avoids the cumulative drift that a
 // fixed-cell rounding accumulates (which corrupts sectors).
-const SCP_PLL_GAIN: f64 = 0.15;
-const SCP_PLL_MIN_CELL_NS: f64 = 1_500.0;
-const SCP_PLL_MAX_CELL_NS: f64 = 2_500.0;
+const FLUX_PLL_GAIN: f64 = 0.15;
+const FLUX_PLL_MIN_CELL_NS: f64 = 1_500.0;
+const FLUX_PLL_MAX_CELL_NS: f64 = 2_500.0;
 
 #[cfg(feature = "internal-diagnostics")]
 fn disk_speed_div() -> Option<(u32, f64)> {
@@ -2742,10 +2742,115 @@ fn scp_revolution_bit_len(index_time: u32, flags: u8) -> Result<Option<u32>> {
 fn scp_bit_len_from_ns(ns: u64) -> Result<u32> {
     let bits = ((ns + AMIGA_DD_BITCELL_NS / 2) / AMIGA_DD_BITCELL_NS).max(1);
     ensure!(
-        bits <= u64::from(MAX_SCP_REVOLUTION_BITS),
-        "SCP revolution bit length {bits} exceeds supported limit {MAX_SCP_REVOLUTION_BITS}"
+        bits <= u64::from(MAX_FLUX_REVOLUTION_BITS),
+        "SCP revolution bit length {bits} exceeds supported limit {MAX_FLUX_REVOLUTION_BITS}"
     );
     Ok(bits as u32)
+}
+
+/// MFM cells recovered from flux, with the timing each cell was measured at.
+pub(crate) struct FluxCells {
+    pub words: Vec<u16>,
+    pub bit_len: u32,
+    pub bitcell_ns: Vec<u32>,
+}
+
+/// The data separator: recover MFM cells from the intervals between flux
+/// reversals.
+///
+/// This is the one place cells are recovered from flux, whether the flux came
+/// off a physical disk or out of a captured image, so both are read the same
+/// way. It stands in for the analogue separator ahead of Paula's shifter.
+///
+/// Intervals arrive in nanoseconds. For each one the cell count is
+/// `round(interval / cell)` and the cell-time estimate is then nudged towards
+/// the measured per-cell time, so the window tracks the disk's local rate
+/// instead of a fixed 2 us grid -- a disk running off nominal, or varying
+/// through a revolution, would otherwise accumulate drift until cells were
+/// misread. A reversal is a "1" cell preceded by (n-1) "0" cells.
+///
+/// `trailing_ns` is time after the last reversal with no reversal in it, which
+/// still occupies the track. `target_bit_len` pins the revolution's length when
+/// the index says what it must be; without it the stream is whatever the flux
+/// produced, up to [`MAX_FLUX_REVOLUTION_BITS`].
+pub(crate) fn flux_to_mfm_cells(
+    intervals_ns: impl IntoIterator<Item = f64>,
+    trailing_ns: f64,
+    target_bit_len: Option<u32>,
+) -> Result<FluxCells> {
+    let bit_cap = target_bit_len.unwrap_or(MAX_FLUX_REVOLUTION_BITS);
+    let capped_by_index = target_bit_len.is_some();
+    let mut words = Vec::new();
+    let mut bitcell_ns = Vec::new();
+    let mut bit_len = 0u32;
+    let mut cell_ns = AMIGA_DD_BITCELL_NS as f64;
+    for interval_ns in intervals_ns {
+        let cells = (interval_ns / cell_ns).round().max(1.0);
+        let measured = interval_ns / cells;
+        cell_ns += (measured - cell_ns) * FLUX_PLL_GAIN;
+        cell_ns = cell_ns.clamp(FLUX_PLL_MIN_CELL_NS, FLUX_PLL_MAX_CELL_NS);
+        let per_cell_ns = measured.round().clamp(1.0, u32::MAX as f64) as u32;
+        let cells = cells as u64;
+        append_flux_cells(
+            &mut words,
+            &mut bitcell_ns,
+            &mut bit_len,
+            cells.saturating_sub(1),
+            false,
+            bit_cap,
+            capped_by_index,
+            per_cell_ns,
+        )
+        .context("flux interval")?;
+        append_flux_cells(
+            &mut words,
+            &mut bitcell_ns,
+            &mut bit_len,
+            1,
+            true,
+            bit_cap,
+            capped_by_index,
+            per_cell_ns,
+        )
+        .context("flux interval")?;
+    }
+    if trailing_ns > 0.0 && !capped_by_index {
+        // A no-flux gap before the index hole: idle cells at the rate the
+        // separator last recovered.
+        let cells = (trailing_ns / cell_ns).round().max(0.0) as u64;
+        append_flux_cells(
+            &mut words,
+            &mut bitcell_ns,
+            &mut bit_len,
+            cells,
+            false,
+            bit_cap,
+            capped_by_index,
+            cell_ns.round() as u32,
+        )
+        .context("trailing flux gap")?;
+    }
+    if let Some(target) = target_bit_len {
+        // Nothing was measured past the last reversal, so cells padding out to
+        // the index keep nominal DD timing.
+        let padding_cells = u64::from(target.saturating_sub(bit_len));
+        append_flux_cells(
+            &mut words,
+            &mut bitcell_ns,
+            &mut bit_len,
+            padding_cells,
+            false,
+            target,
+            true,
+            AMIGA_DD_BITCELL_NS as u32,
+        )?;
+    }
+    ensure!(bit_len > 0, "flux produced an empty bit stream");
+    Ok(FluxCells {
+        words,
+        bit_len,
+        bitcell_ns,
+    })
 }
 
 fn scp_flux_to_mfm_words(
@@ -2759,19 +2864,11 @@ fn scp_flux_to_mfm_words(
         flux.len().is_multiple_of(2),
         "SCP track {track} revolution {rev} has odd flux byte length"
     );
-    let bit_cap = target_bit_len.unwrap_or(MAX_SCP_REVOLUTION_BITS);
-    let capped_by_index = target_bit_len.is_some();
-    let mut words = Vec::new();
-    let mut bitcell_ns = Vec::new();
-    let mut bit_len = 0u32;
+    // SCP stores each interval as a 16-bit tick count, with a zero entry
+    // meaning the counter wrapped: the interval continues into the next entry.
+    let mut intervals_ns = Vec::new();
+    let mut trailing_ns = 0.0f64;
     let mut overflow_ticks = 0u64;
-    // PLL data separator: recover MFM cells from flux intervals, locking the
-    // cell-time estimate onto the local flux rate. For each interval the cell
-    // count is `round(interval / cell)`; the estimate is then nudged toward the
-    // measured per-cell time. A flux transition is a "1" cell preceded by
-    // (n-1) "0" cells. This avoids the cumulative drift a fixed 2 us grid
-    // accumulates when the disk's true rate differs from nominal.
-    let mut cell_ns = AMIGA_DD_BITCELL_NS as f64;
     for chunk in flux.chunks_exact(2) {
         let ticks = u64::from(read_be_u16(chunk));
         if ticks == 0 {
@@ -2780,80 +2877,24 @@ fn scp_flux_to_mfm_words(
         }
         let total_ticks = overflow_ticks.saturating_add(ticks);
         overflow_ticks = 0;
-        let interval_ns = total_ticks
-            .checked_mul(flux_resolution_ns)
-            .context("SCP flux interval overflows nanoseconds")? as f64;
-        let cells = (interval_ns / cell_ns).round().max(1.0);
-        let measured = interval_ns / cells;
-        cell_ns += (measured - cell_ns) * SCP_PLL_GAIN;
-        cell_ns = cell_ns.clamp(SCP_PLL_MIN_CELL_NS, SCP_PLL_MAX_CELL_NS);
-        let per_cell_ns = measured.round().clamp(1.0, u32::MAX as f64) as u32;
-        let cells = cells as u64;
-        append_scp_cells(
-            &mut words,
-            &mut bitcell_ns,
-            &mut bit_len,
-            cells.saturating_sub(1),
-            false,
-            bit_cap,
-            capped_by_index,
-            per_cell_ns,
-        )
-        .with_context(|| format!("SCP track {track} revolution {rev} flux interval"))?;
-        append_scp_cells(
-            &mut words,
-            &mut bitcell_ns,
-            &mut bit_len,
-            1,
-            true,
-            bit_cap,
-            capped_by_index,
-            per_cell_ns,
-        )
-        .with_context(|| format!("SCP track {track} revolution {rev} flux interval"))?;
+        intervals_ns.push(
+            total_ticks
+                .checked_mul(flux_resolution_ns)
+                .context("SCP flux interval overflows nanoseconds")? as f64,
+        );
     }
-    if overflow_ticks != 0 && !capped_by_index {
-        // Trailing no-flux gap before the index hole: pad with idle cells at
-        // the current recovered rate.
-        let interval_ns = overflow_ticks
+    if overflow_ticks != 0 {
+        trailing_ns = overflow_ticks
             .checked_mul(flux_resolution_ns)
             .context("SCP flux silence overflows nanoseconds")? as f64;
-        let cells = (interval_ns / cell_ns).round().max(0.0) as u64;
-        append_scp_cells(
-            &mut words,
-            &mut bitcell_ns,
-            &mut bit_len,
-            cells,
-            false,
-            bit_cap,
-            capped_by_index,
-            cell_ns.round() as u32,
-        )
-        .with_context(|| format!("SCP track {track} revolution {rev} trailing flux overflow"))?;
     }
-    if let Some(target) = target_bit_len {
-        // SCP gives no per-cell timing after the last transition; the
-        // synthetic index-padding cells retain nominal DD timing.
-        let padding_cells = u64::from(target.saturating_sub(bit_len));
-        append_scp_cells(
-            &mut words,
-            &mut bitcell_ns,
-            &mut bit_len,
-            padding_cells,
-            false,
-            target,
-            true,
-            AMIGA_DD_BITCELL_NS as u32,
-        )?;
-    }
-    ensure!(
-        bit_len > 0,
-        "SCP track {track} revolution {rev} produced an empty bit stream"
-    );
-    Ok((words, bit_len, bitcell_ns))
+    let cells = flux_to_mfm_cells(intervals_ns, trailing_ns, target_bit_len)
+        .with_context(|| format!("SCP track {track} revolution {rev}"))?;
+    Ok((cells.words, cells.bit_len, cells.bitcell_ns))
 }
 
-fn append_scp_cells(
+#[allow(clippy::too_many_arguments)]
+fn append_flux_cells(
     words: &mut Vec<u16>,
     bitcell_ns: &mut Vec<u32>,
     bit_len: &mut u32,
@@ -2865,7 +2906,7 @@ fn append_scp_cells(
 ) -> Result<()> {
     let available = u64::from(bit_cap.saturating_sub(*bit_len));
     if cells > available && !capped_by_index {
-        bail!("SCP flux stream exceeds supported bit length {MAX_SCP_REVOLUTION_BITS}");
+        bail!("flux stream exceeds the supported revolution bit length {MAX_FLUX_REVOLUTION_BITS}");
     }
     for _ in 0..cells.min(available) {
         push_mfm_bit(words, bit_len, bit);

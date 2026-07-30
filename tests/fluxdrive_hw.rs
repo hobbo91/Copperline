@@ -3,10 +3,10 @@
 //! Hardware probes for the flux-level floppy path.
 //!
 //! These need a flux interface with a drive and a disk in it, so they are
-//! ignored by default:
+//! ignored by default. There is one drive, so they run one at a time:
 //!
 //! ```sh
-//! cargo test --release --test fluxdrive_hw -- --ignored --nocapture
+//! cargo test --release --test fluxdrive_hw -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! `COPPERLINE_FLUXDRIVE_PORT` names the serial port, or is left unset to pick
@@ -16,6 +16,8 @@
 
 #![cfg(feature = "fluxdrive")]
 
+use copperline::fluxdrive::amigados::{self, BYTES_PER_SECTOR, SECTORS_PER_TRACK};
+use copperline::fluxdrive::cells::recover_cells;
 use copperline::fluxdrive::greaseweazle::{DriveSelect, Greaseweazle};
 use copperline::fluxdrive::{FluxSource, Head};
 
@@ -168,5 +170,193 @@ fn flux_from_a_real_disk_has_amiga_dd_geometry() {
         "{cells:.0} cells is not a double-density Amiga track"
     );
 
+    drive.motor(false).expect("spin the disk down");
+}
+
+/// The track number an AmigaDOS sector header carries: two per cylinder.
+fn track_number(cylinder: u8, head: Head) -> u8 {
+    cylinder * 2 + head.index()
+}
+
+/// Read one track off the disk and recover its sectors, revolution by
+/// revolution.
+fn read_track(drive: &mut Greaseweazle, cylinder: u8, head: Head, revolutions: u8) -> Vec<Scanned> {
+    drive.seek(cylinder).expect("seek");
+    drive.select_head(head).expect("select head");
+    let capture = drive.read_flux(revolutions).expect("capture flux");
+    (0..capture.revolutions())
+        .map(|rev| {
+            let revolution = capture.revolution(rev).expect("whole revolution");
+            let recovered =
+                recover_cells(&revolution, capture.ticks_per_sec).expect("recover cells");
+            let scan = amigados::scan_track(
+                &recovered.words,
+                recovered.bit_len as usize,
+                Some(track_number(cylinder, head)),
+            );
+            Scanned {
+                mean_cell_ns: recovered.mean_cell_ns(),
+                bit_len: recovered.bit_len,
+                scan,
+            }
+        })
+        .collect()
+}
+
+struct Scanned {
+    mean_cell_ns: f64,
+    bit_len: u32,
+    scan: amigados::TrackScan,
+}
+
+/// Phase 0: raw flux off a physical disk, through Copperline's own data
+/// separator, to eleven checksummed AmigaDOS sectors.
+///
+/// Every revolution is decoded on its own. That matters beyond redundancy: the
+/// guest's trackdisk driver recovers a marginal sector by re-reading the track,
+/// which only helps if a re-read sees freshly measured flux. A revolution that
+/// decodes independently is what makes that possible.
+#[test]
+#[ignore = "requires a flux interface with an AmigaDOS disk in the drive"]
+fn flux_decodes_to_complete_amigados_tracks() {
+    let mut drive = open_drive();
+    println!("{}", drive.describe());
+    drive.motor(true).expect("spin the disk up");
+
+    // A spread across the disk: the outermost cylinder, one in the middle where
+    // the guest keeps the root block, and one near the inside where cells are
+    // physically shortest and reads are hardest.
+    let probes = [(0u8, Head::Lower), (40, Head::Upper), (79, Head::Lower)];
+    let mut revolutions_seen = 0;
+
+    for (cylinder, head) in probes {
+        let track = track_number(cylinder, head);
+        println!("cylinder {cylinder}, head {}, track {track}:", head.index());
+        let scans = read_track(&mut drive, cylinder, head, 3);
+        assert!(
+            scans.len() >= 3,
+            "expected 3 revolutions, got {}",
+            scans.len()
+        );
+
+        for (rev, scanned) in scans.iter().enumerate() {
+            println!(
+                "  revolution {rev}: {}, {} cells, mean {:.1} ns/cell",
+                scanned.scan.summary(),
+                scanned.bit_len,
+                scanned.mean_cell_ns,
+            );
+            assert!(
+                scanned.scan.is_complete(),
+                "cylinder {cylinder} head {} revolution {rev}: {}",
+                head.index(),
+                scanned.scan.summary()
+            );
+            for sector in &scanned.scan.sectors {
+                assert_eq!(sector.track, track, "sector header names the wrong track");
+            }
+            revolutions_seen += 1;
+        }
+    }
+
+    println!("{revolutions_seen} revolutions, every one complete");
+    drive.motor(false).expect("spin the disk down");
+}
+
+/// The strongest check available: compare what came off the physical disk with
+/// an image of that same disk, byte for byte.
+///
+/// Checksums only prove a sector is self-consistent. This proves the whole path
+/// -- flux timing, cell recovery, the odd/even split, sector ordering -- puts
+/// back exactly the bytes that are on the disk.
+///
+/// Set `COPPERLINE_FLUXDRIVE_ADF` to an image **of the disk in the drive**, not
+/// merely to the same title. A pressed or well-used disk is very often not a
+/// byte-exact copy of any image of it going around, so comparing against the
+/// wrong dump reports differences that are really the disk's own history. The
+/// straightforward way to get a correct one is to dump the disk itself first,
+/// with a tool that decodes independently of this code.
+#[test]
+#[ignore = "requires a flux interface plus an image of the disk in the drive"]
+fn decoded_sectors_match_an_image_of_the_same_disk() {
+    let Ok(adf_path) = std::env::var("COPPERLINE_FLUXDRIVE_ADF") else {
+        eprintln!("skipped: set COPPERLINE_FLUXDRIVE_ADF to an image of the disk in the drive");
+        return;
+    };
+    let adf = std::fs::read(&adf_path).expect("read the reference image");
+    let expected_len = 160 * SECTORS_PER_TRACK * BYTES_PER_SECTOR;
+    assert_eq!(
+        adf.len(),
+        expected_len,
+        "{adf_path} is not a standard 880K double-density image"
+    );
+
+    let mut drive = open_drive();
+    println!("{}", drive.describe());
+    println!("comparing against {adf_path}");
+    drive.motor(true).expect("spin the disk up");
+
+    // Across the disk, including cylinder 58, where this disk's oxide is weakest
+    // and a revolution often gives up a sector.
+    let probes = [
+        (0u8, Head::Lower),
+        (0, Head::Upper),
+        (40, Head::Lower),
+        (58, Head::Lower),
+        (58, Head::Upper),
+        (79, Head::Upper),
+    ];
+    let mut compared = 0usize;
+
+    for (cylinder, head) in probes {
+        let track = track_number(cylinder, head);
+        let scans = read_track(&mut drive, cylinder, head, 3);
+
+        // Take the first revolution that read whole. Marginal oxide gives up a
+        // sector on one pass and not the next, and a real Amiga recovers by
+        // re-reading until the software checksum passes, so a track is only
+        // genuinely bad if no revolution of it is complete.
+        let complete = scans.iter().position(|s| s.scan.is_complete());
+        let Some(rev) = complete else {
+            for (rev, scanned) in scans.iter().enumerate() {
+                eprintln!(
+                    "  track {track} revolution {rev}: {}",
+                    scanned.scan.summary()
+                );
+            }
+            panic!(
+                "track {track} did not read whole in any of {} revolutions",
+                scans.len()
+            );
+        };
+        if rev != 0 {
+            println!(
+                "  track {track}: revolution 0 read {}, recovered on revolution {rev}",
+                scans[0].scan.summary()
+            );
+        }
+        let sectors = scans[rev]
+            .scan
+            .assemble()
+            .expect("complete track assembles");
+
+        for (sector, data) in sectors.iter().enumerate() {
+            let offset = (usize::from(track) * SECTORS_PER_TRACK + sector) * BYTES_PER_SECTOR;
+            let reference = &adf[offset..offset + BYTES_PER_SECTOR];
+            let first_difference = data.iter().zip(reference).position(|(a, b)| a != b);
+            assert!(
+                first_difference.is_none(),
+                "track {track} sector {sector} differs from the image at byte {}: \
+                 read {:#04x}, image {:#04x}",
+                first_difference.unwrap(),
+                data[first_difference.unwrap()],
+                reference[first_difference.unwrap()],
+            );
+            compared += 1;
+        }
+        println!("  track {track}: all {SECTORS_PER_TRACK} sectors match the image");
+    }
+
+    println!("{compared} sectors identical to the reference image");
     drive.motor(false).expect("spin the disk down");
 }
