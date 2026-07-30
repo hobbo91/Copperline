@@ -282,7 +282,25 @@ pub fn available() -> Vec<Discovered> {
             }
             _ => None,
         })
+        .filter(|found| is_usable_node(&found.port))
         .collect()
+}
+
+/// Whether a serial device node is the one to open.
+///
+/// macOS exposes every serial device twice: `/dev/cu.*` is the call-out node and
+/// `/dev/tty.*` the call-in node, which blocks on open until carrier detect is
+/// asserted. A USB CDC device never asserts it, so opening the `tty` node hangs.
+/// Only the `cu` node is usable, and skipping the other also stops one board
+/// looking like two.
+#[cfg(target_os = "macos")]
+fn is_usable_node(port: &str) -> bool {
+    !port.starts_with("/dev/tty.")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_usable_node(_port: &str) -> bool {
+    true
 }
 
 #[derive(Clone, Debug)]
