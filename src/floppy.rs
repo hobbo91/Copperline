@@ -724,31 +724,20 @@ impl FloppyController {
                         self.sound_steps = self.sound_steps.saturating_add(1);
                     }
                 }
-                // With no disk in it, send the real head after the emulated
-                // one, one step for one step.
+                // Send the real head after the emulated one, a step for a step.
                 //
-                // This is where the empty-drive click comes from, and it comes
-                // from the guest: its trackdisk recalibrates and steps about
-                // while polling for a disk, and the mechanism answers audibly
-                // because the head really moves. A step outward at cylinder 0
-                // moves nothing and is silent, on a real drive exactly as here,
-                // so nothing may manufacture movement to make a noise -- the
-                // sound is whatever the guest actually asked the head to do.
-                //
-                // Only with no disk, though. While there is one, head movement
-                // belongs to the capture, which the interface precedes with its
-                // own settle time. Stepping ahead of it leaves that seek with
-                // nothing to do, so the read begins while the head is still
-                // ringing -- good flux off the wrong part of the disk, which
-                // the guest cannot make sense of at all.
+                // This is not only about position. `/DSKCHG` is a latch the drive
+                // clears when the head steps with a disk in place, so the guest's
+                // stepping is what tells a loaded drive from an empty one -- and
+                // it is why an Amiga clicks away at a drive with nothing in it:
+                // the latch never clears, so trackdisk keeps testing it. The
+                // click and the detection are the same act, and both belong to
+                // the guest, which is why nothing here manufactures either.
                 #[cfg(feature = "fluxdrive")]
                 {
                     let cylinder = self.drives[idx].cylinder;
-                    let empty = !self.drives[idx].has_media();
                     if let Some(flux) = self.drives[idx].flux.as_mut() {
-                        if empty {
-                            flux.seek(cylinder);
-                        }
+                        flux.seek(cylinder);
                     }
                 }
             }
@@ -1788,7 +1777,9 @@ impl FloppyController {
         }
         if let Some(present) = sensed_media {
             // A disk arriving or leaving is a change, and the guest is told the
-            // same way it is told about an image being swapped.
+            // same way it is told about an image being swapped. Everything read
+            // off the old disk goes with it: serving a cached track from a disk
+            // that has left the building is the one thing a real drive cannot do.
             if present != drive.flux_media_seen {
                 drive.flux_media_seen = present;
                 drive.set_disk_change(true);

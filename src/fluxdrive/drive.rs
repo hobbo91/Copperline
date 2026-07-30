@@ -21,7 +21,7 @@ use super::cells::{recover_cells, RecoveredTrack};
 use super::{FluxSource, Head};
 use anyhow::{anyhow, Result};
 use log::{debug, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -29,13 +29,15 @@ use std::thread::JoinHandle;
 /// What the emulated side asks the drive to do.
 enum Command {
     Motor(bool),
-    /// Move the real head to where the guest has stepped the emulated one.
+    /// The guest has moved its head; go to wherever it is now.
     ///
-    /// Sent for the guest's steps as they happen, rather than only when a track
-    /// is wanted, because the head following the stepper *is* the behaviour: it
-    /// is what makes an empty drive click as the guest polls it, and what leaves
-    /// the head where the guest believes it is.
-    Seek(u8),
+    /// Carries no cylinder of its own on purpose. The guest steps every 3 ms and
+    /// a command over USB cannot, so a queue of these would replay its whole
+    /// journey -- dragging the real head cylinder by cylinder through a seek the
+    /// emulated one finished long ago, and starving whatever wanted to read. The
+    /// destination is read fresh from `target_cylinder` when the command is
+    /// acted on, so a backlog collapses into one move to where the head belongs.
+    Seek,
     Capture {
         cylinder: u8,
         head: Head,
@@ -102,6 +104,9 @@ pub struct FluxDrive {
     /// Set when the thread has gone, so the bay can stop asking.
     lost: bool,
     stopping: Arc<AtomicBool>,
+    /// Where the guest's head is, read by the drive's thread when it gets round
+    /// to moving. Shared rather than queued so a backlog cannot replay a seek.
+    target_cylinder: Arc<AtomicU8>,
 }
 
 impl FluxDrive {
@@ -119,6 +124,9 @@ impl FluxDrive {
         // asked for first.
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = Arc::clone(&stopping);
+        // Where the guest's head is now, which is all the drive needs to know.
+        let target_cylinder = Arc::new(AtomicU8::new(0));
+        let worker_target = Arc::clone(&target_cylinder);
 
         let worker = std::thread::Builder::new()
             .name("fluxdrive".to_string())
@@ -138,7 +146,8 @@ impl FluxDrive {
                                 motor_running = on;
                             }
                         }
-                        Command::Seek(cylinder) => {
+                        Command::Seek => {
+                            let cylinder = worker_target.load(Ordering::Relaxed);
                             // A step that will not go through is not worth
                             // reporting every time: the guest steps a drive it
                             // believes is at the end stop quite deliberately.
@@ -231,15 +240,20 @@ impl FluxDrive {
             sent_cylinder: None,
             lost: false,
             stopping,
+            target_cylinder,
         }
     }
 
-    /// Move the real head to `cylinder`, following the guest's stepper.
+    /// Note where the guest's head now is, so the real one follows.
     pub fn seek(&mut self, cylinder: u8) {
-        if self.lost || self.sent_cylinder == Some(cylinder) {
+        if self.lost {
             return;
         }
-        if self.commands.send(Command::Seek(cylinder)).is_err() {
+        self.target_cylinder.store(cylinder, Ordering::Relaxed);
+        if self.sent_cylinder == Some(cylinder) {
+            return;
+        }
+        if self.commands.send(Command::Seek).is_err() {
             self.lost = true;
             return;
         }
@@ -335,6 +349,7 @@ impl FluxDrive {
         }
         // The capture seeks on the drive's thread, so record where that leaves
         // the head or the next step would be thought already sent.
+        self.target_cylinder.store(cylinder, Ordering::Relaxed);
         self.sent_cylinder = Some(cylinder);
         self.pending = Some((cylinder, head));
         true

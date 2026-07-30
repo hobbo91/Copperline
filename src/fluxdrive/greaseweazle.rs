@@ -201,6 +201,16 @@ const PIN_DISK_CHANGE: u8 = 34;
 /// a track takes to read.
 const STEP_INTERVAL_US: u16 = 3_000;
 
+/// How long after the head moves before its output is worth reading.
+///
+/// The carriage rings for a moment after a step, and flux taken during it comes
+/// off the wrong part of the disk. The interface applies its own settle time
+/// inside a seek, but only when a seek actually moves the head -- and the head
+/// may well have been moved a moment earlier by the guest's own stepper, leaving
+/// the seek before a read with nothing to do. So the wait is kept here, where it
+/// depends on when the head last moved rather than on who moved it.
+const HEAD_SETTLE: Duration = Duration::from_millis(15);
+
 /// A capture is asked for by revolution count, but the firmware also wants a
 /// tick ceiling so a stopped disk cannot hang the read forever. Nothing is
 /// gained by cutting it fine: this only bounds the wait.
@@ -275,6 +285,9 @@ pub struct Greaseweazle {
     cylinder: Option<u8>,
     head: Head,
     motor_on: bool,
+    /// When the head last actually moved, so a read can wait out the carriage
+    /// settling however the move came about.
+    moved_at: Option<Instant>,
 }
 
 /// Serial ports that look like a Greaseweazle, most likely first.
@@ -408,6 +421,7 @@ impl Greaseweazle {
             cylinder: None,
             head: Head::Lower,
             motor_on: false,
+            moved_at: None,
         };
 
         gw.clear_comms()?;
@@ -639,6 +653,25 @@ impl Greaseweazle {
         Ok(self.read_pin(PIN_TRK0)?.is_some_and(|asserted| asserted))
     }
 
+    /// Raw level of a drive line, for comparing against other tools.
+    pub fn pin_level(&mut self, pin: u8) -> Result<Option<bool>> {
+        match self.send(&[cmd::GET_PIN, 3, pin]) {
+            Ok(()) => {}
+            Err(err) => {
+                let unsupported = err
+                    .downcast_ref::<CommandError>()
+                    .is_some_and(|e| e.code == ack::BAD_PIN || e.code == ack::BAD_COMMAND);
+                if unsupported {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+        }
+        let mut level = [0u8; 1];
+        self.read_exact(&mut level, Instant::now() + COMMAND_TIMEOUT)?;
+        Ok(Some(level[0] != 0))
+    }
+
     /// Read one drive line, or `None` when this board cannot reach that pin.
     ///
     /// Answers whether the signal is *asserted*, having already accounted for
@@ -786,6 +819,7 @@ impl FluxSource for Greaseweazle {
         }
 
         self.cylinder = Some(cylinder);
+        self.moved_at = Some(Instant::now());
         Ok(())
     }
 
@@ -820,6 +854,14 @@ impl FluxSource for Greaseweazle {
             self.motor_on,
             "the drive motor is off: a stopped disk produces no flux"
         );
+        // Wait out anything left of the carriage settling, whoever moved it.
+        if let Some(moved_at) = self.moved_at {
+            let waited = moved_at.elapsed();
+            if waited < HEAD_SETTLE {
+                std::thread::sleep(HEAD_SETTLE - waited);
+            }
+            self.moved_at = None;
+        }
 
         // The head is wherever the disk happens to have reached, so the first
         // partial revolution is not a whole track. Ask for one more than is

@@ -393,3 +393,29 @@ fn watch_the_drive_status_lines() {
     }
     println!("\ndone");
 }
+
+/// Print raw drive-line levels, to compare against another tool's reading.
+#[test]
+#[ignore = "requires a flux interface"]
+fn print_raw_pin_levels() {
+    let mut drive = open_drive();
+    println!("{}", drive.describe());
+    for pin in [2u8, 26, 28, 34] {
+        let level = drive.pin_level(pin).expect("read the pin");
+        let name = match pin {
+            2 => "/DENSEL",
+            26 => "/TRK0",
+            28 => "/WRPROT",
+            34 => "/DSKCHG",
+            _ => "?",
+        };
+        println!(
+            "  pin {pin:2} {name:8}: {}",
+            match level {
+                Some(true) => "high",
+                Some(false) => "low",
+                None => "unsupported",
+            }
+        );
+    }
+}
