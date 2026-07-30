@@ -419,3 +419,34 @@ fn print_raw_pin_levels() {
         );
     }
 }
+
+/// Does a spun-up-from-cold read need to wait for the spindle?
+///
+/// A probe for a disk turns the motor on and reads. If the platter is not yet at
+/// speed no index pulse comes round, and the drive reports itself empty when it
+/// is not -- so how long the wait has to be decides whether a disk put in while
+/// the machine runs is ever noticed.
+#[test]
+#[ignore = "requires a flux interface with a disk in the drive"]
+fn a_cold_spin_up_needs_time_before_reading() {
+    let mut drive = open_drive();
+    println!("{}", drive.describe());
+
+    for wait_ms in [0u64, 250, 500, 750, 1000] {
+        drive.motor(false).expect("stop the motor");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        drive.motor(true).expect("start the motor");
+        if wait_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+        }
+        let outcome = drive.read_flux(1);
+        println!(
+            "  waited {wait_ms:4} ms after motor-on: {}",
+            match &outcome {
+                Ok(c) => format!("read {} revolutions", c.revolutions()),
+                Err(e) => format!("FAILED -- {e}"),
+            }
+        );
+    }
+    drive.motor(false).expect("stop the motor");
+}

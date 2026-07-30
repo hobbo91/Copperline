@@ -1814,6 +1814,55 @@ impl FloppyController {
                 }
             }
 
+            // Collect anything the drive has finished, whatever it was and
+            // wherever the head has since gone. Draining here rather than where
+            // tracks are served matters: a drive with nothing in it never gets
+            // to that path at all, so its answers would pile up unread and it
+            // would never be asked anything again.
+            {
+                let mut captured_tracks = Vec::new();
+                if let Some(flux) = drive.flux.as_mut() {
+                    while let Some(captured) = flux.poll() {
+                        captured_tracks.push(captured);
+                    }
+                }
+                for captured in captured_tracks {
+                    let captured_track =
+                        usize::from(captured.cylinder) * SIDES + usize::from(captured.head.index());
+                    let revs: Vec<TrackRev> = captured
+                        .revolutions
+                        .iter()
+                        .map(|rev| {
+                            TrackRev::measured(
+                                rev.words.clone(),
+                                rev.bit_len as usize,
+                                &rev.bitcell_ns,
+                            )
+                        })
+                        .collect();
+                    if revs.is_empty() {
+                        continue;
+                    }
+                    let mean_cell_ns = captured
+                        .revolutions
+                        .first()
+                        .map(|r| r.mean_cell_ns())
+                        .unwrap_or_default();
+                    debug!(
+                        "floppy.df{idx} track {captured_track} (cyl {} head {}) read: \
+                         {} revolutions, {} cells, {mean_cell_ns:.0} ns/cell",
+                        captured.cylinder,
+                        captured.head.index(),
+                        revs.len(),
+                        revs[0].bit_len,
+                    );
+                    if drive.flux_tracks.len() <= captured_track {
+                        drive.flux_tracks.resize(captured_track + 1, None);
+                    }
+                    drive.flux_tracks[captured_track] = Some(CachedTrack { revs });
+                }
+            }
+
             if let Some(present) = sensed_media {
                 // A disk arriving or leaving is a change, told to the guest the
                 // same way an image being swapped is. Everything read off the old
@@ -1875,41 +1924,6 @@ impl FloppyController {
                 drive.motor_cck,
             );
             return;
-        }
-
-        // Collect whatever the drive has finished. It may be a track the head
-        // has since stepped away from, which is kept all the same: it cost a
-        // rotation to fetch and is still a good reading of that track, so the
-        // guest coming back to it finds it waiting.
-        while let Some(captured) = flux.poll() {
-            let captured_track =
-                usize::from(captured.cylinder) * SIDES + usize::from(captured.head.index());
-            let revs: Vec<TrackRev> = captured
-                .revolutions
-                .iter()
-                .map(|rev| {
-                    TrackRev::measured(rev.words.clone(), rev.bit_len as usize, &rev.bitcell_ns)
-                })
-                .collect();
-            if !revs.is_empty() {
-                let mean_cell_ns = captured
-                    .revolutions
-                    .first()
-                    .map(|r| r.mean_cell_ns())
-                    .unwrap_or_default();
-                debug!(
-                    "floppy.df{idx} track {captured_track} (cyl {} head {}) read: \
-                     {} revolutions, {} cells, {mean_cell_ns:.0} ns/cell",
-                    captured.cylinder,
-                    captured.head.index(),
-                    revs.len(),
-                    revs[0].bit_len,
-                );
-                if drive.flux_tracks.len() <= captured_track {
-                    drive.flux_tracks.resize(captured_track + 1, None);
-                }
-                drive.flux_tracks[captured_track] = Some(CachedTrack { revs });
-            }
         }
 
         // Read this track before? Hand back what it said then. It holds several

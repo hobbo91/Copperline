@@ -384,13 +384,23 @@ impl FluxDrive {
                 }
                 Ok(Event::Status(status)) => {
                     self.status_pending = false;
-                    // The change line is a latch the drive only clears once the
-                    // head steps with a disk in place, so on many drives it
-                    // reads "changed" for ever and says nothing about presence.
-                    // Believed only when this drive is known to fit it.
+                    // The change line does not say "empty": it says *something
+                    // happened*. The drive asserts it when a disk leaves and
+                    // clears it once the head steps with one back in, so an
+                    // asserted line covers an empty slot and a disk just put in
+                    // equally well. Taking it for absence makes presence flap
+                    // every time a disk is touched.
+                    //
+                    // So a cleared line is believed -- there is certainly a disk
+                    // in there -- and an asserted one only unsettles what was
+                    // known, leaving the probe to say which of the two it is.
                     if self.trust_change_pin {
-                        if let Some(present) = status.disk_present {
-                            self.disk_present = Some(present);
+                        match status.disk_present {
+                            Some(true) => self.disk_present = Some(true),
+                            Some(false) if self.disk_present == Some(true) => {
+                                self.disk_present = None;
+                            }
+                            _ => {}
                         }
                     }
                     if let Some(protected) = status.write_protected {
