@@ -503,3 +503,68 @@ fn time_the_parts_of_a_track_read() {
     }
     drive.motor(false).expect("spin down");
 }
+
+/// Does a revolution have to begin at the index hole?
+///
+/// Waiting for one costs a whole rotation on every read -- a read ends at an
+/// index, so the next begins just past it and waits all the way round again.
+/// That wait is only worth paying if a ring cut anywhere else is worse.
+///
+/// It should not be: a ring exactly one rotation long closes on the same
+/// physical spot it opened, so the sectors run continuously across the join. The
+/// two ends are merely read one revolution apart in time, so only bit-level
+/// jitter differs there.
+#[test]
+#[ignore = "requires a flux interface with an AmigaDOS disk in the drive"]
+fn a_revolution_need_not_begin_at_the_index() {
+    let mut drive = open_drive();
+    println!("{}", drive.describe());
+    drive.motor(true).expect("spin up");
+
+    for (cylinder, head) in [(0u8, Head::Lower), (40, Head::Upper), (79, Head::Lower)] {
+        let track = track_number(cylinder, head);
+        drive.seek(cylinder).expect("seek");
+        drive.select_head(head).expect("head");
+        let capture = drive.read_flux(3).expect("capture");
+
+        // The rotation period, measured index to index.
+        let aligned = capture.revolution(0).expect("a whole revolution");
+        let period = aligned.ticks;
+
+        // The index-aligned reading, for comparison.
+        let cells = recover_cells(&aligned, capture.ticks_per_sec).expect("cells");
+        let scan = amigados::scan_track(&cells.words, cells.bit_len as usize, Some(track));
+        println!("track {track}: index-aligned {}", scan.summary());
+
+        // ...and rings cut at arbitrary points instead, each exactly one
+        // rotation long, as a read that never waited for an index would give.
+        for fraction in [0.17, 0.41, 0.63, 0.88] {
+            let start = aligned.ticks / 2 + (period as f64 * fraction) as u64;
+            let end = start + period;
+            let mut intervals = Vec::new();
+            let mut at = 0u64;
+            let mut last = start;
+            for &interval in &capture.intervals {
+                let previous = at;
+                at += u64::from(interval);
+                if at <= start {
+                    continue;
+                }
+                if at > end {
+                    break;
+                }
+                intervals.push((at - previous.max(start)) as u32);
+                last = at;
+            }
+            let cut = copperline::fluxdrive::Revolution {
+                intervals,
+                ticks: period,
+                trailing_ticks: end.saturating_sub(last),
+            };
+            let cells = recover_cells(&cut, capture.ticks_per_sec).expect("cells");
+            let scan = amigados::scan_track(&cells.words, cells.bit_len as usize, Some(track));
+            println!("           cut at {fraction:.2}: {}", scan.summary());
+        }
+    }
+    drive.motor(false).expect("spin down");
+}
