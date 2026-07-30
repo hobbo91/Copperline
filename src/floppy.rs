@@ -85,6 +85,15 @@ const MIN_STEP_PULSE_CCK: u64 = 140;
 const SEEK_REVERSAL_SETTLE_CCK: u32 = PAULA_CLOCK_HZ / 1_000 * 18; // ~18 ms on reversal
                                                                    // 300 RPM.
 const ROTATION_HZ: u32 = 5;
+/// How many whole revolutions to take of a physical track at once.
+///
+/// Marginal oxide gives up a sector on one revolution and not the next, and the
+/// guest recovers by re-reading, so a track has to arrive with more than one
+/// reading of itself for that re-read to mean anything. Each costs a rotation of
+/// real time, so this trades how long a first read takes against how much the
+/// guest has to work with.
+#[cfg(feature = "fluxdrive")]
+const FLUX_CAPTURE_REVOLUTIONS: u8 = 3;
 // Turbo mode defers the burst completion of a freshly armed DMA by two
 // scanlines of emulated time (the same deferral WinUAE/FS-UAE apply to
 // their instant path): loaders commonly write DSKLEN and only then clear
@@ -460,7 +469,7 @@ impl FloppyController {
     pub fn disk_inserted(&self, drive_idx: usize) -> bool {
         self.drives
             .get(drive_idx)
-            .is_some_and(|drive| drive.image.is_some())
+            .is_some_and(FloppyDrive::has_media)
     }
 
     /// File name of the inserted image, for UI labels. Read from the image
@@ -477,6 +486,69 @@ impl FloppyController {
         )
     }
 
+    /// Hand a floppy bay a real 3.5" drive instead of an image.
+    ///
+    /// From here on the disk in that drive is the bay's media: it cannot take an
+    /// image, and the status bar's eject and swap have nothing to act on. The
+    /// emulated stepper and motor drive the real mechanism, so the guest moves a
+    /// physical head.
+    #[cfg(feature = "fluxdrive")]
+    pub fn attach_flux_drive(
+        &mut self,
+        drive_idx: usize,
+        drive: crate::fluxdrive::drive::FluxDrive,
+        write_protected: bool,
+    ) -> Result<()> {
+        ensure!(
+            drive_idx < self.drives.len(),
+            "invalid floppy drive df{drive_idx}"
+        );
+        ensure!(
+            self.drives[drive_idx].image.is_none(),
+            "floppy.df{drive_idx} already holds an image; a bay takes one or the other"
+        );
+        let bay = &mut self.drives[drive_idx];
+        bay.write_protected_target = write_protected;
+        bay.write_protected_sense = write_protected;
+        bay.flux_tracks.clear();
+        bay.flux_filler_track = None;
+        bay.flux = Some(drive);
+        // A disk appearing in the drive is a change, exactly as inserting an
+        // image is: the guest is told, and the latch clears on its next step.
+        bay.set_disk_change(true);
+        self.idle_cache = false;
+        Ok(())
+    }
+
+    /// Whether this bay is a real drive rather than an image.
+    #[cfg(feature = "fluxdrive")]
+    pub fn is_flux(&self, drive_idx: usize) -> bool {
+        self.drives.get(drive_idx).is_some_and(|d| d.flux.is_some())
+    }
+
+    #[cfg(feature = "fluxdrive")]
+    pub fn has_flux_drive(&self) -> bool {
+        self.drives.iter().any(|d| d.flux.is_some())
+    }
+
+    /// Let go of every physical drive, stopping their motors and closing their
+    /// interfaces.
+    ///
+    /// Worth doing explicitly on shutdown and reset: while an interface is open
+    /// nothing else can have it, and a motor left running wears the disk.
+    #[cfg(feature = "fluxdrive")]
+    pub fn release_flux_drives(&mut self) {
+        for drive in &mut self.drives {
+            if drive.flux.take().is_none() {
+                continue;
+            }
+            drive.flux_tracks.clear();
+            drive.flux_filler_track = None;
+            drive.cached = CachedTrack::default();
+            drive.cached_track = None;
+        }
+    }
+
     pub fn insert_disk_image(
         &mut self,
         drive_idx: usize,
@@ -487,6 +559,13 @@ impl FloppyController {
             drive_idx < self.drives.len(),
             "invalid floppy drive df{}",
             drive_idx
+        );
+        // A bay is either a real drive or an image, never both: the disk in the
+        // drive is its media, and there is nothing for an image to displace.
+        #[cfg(feature = "fluxdrive")]
+        ensure!(
+            !self.is_flux(drive_idx),
+            "floppy.df{drive_idx} is a real drive: change the disk in it instead"
         );
         let config = FloppyDriveConfig {
             path,
@@ -1231,7 +1310,7 @@ impl FloppyController {
         }
         let idx = self.selected_drive()?;
         let drive = &self.drives[idx];
-        if drive.image.is_none() || !drive.motor_on {
+        if !drive.has_media() || !drive.motor_on {
             return None;
         }
         let rev = drive.cur_rev()?;
@@ -1301,7 +1380,7 @@ impl FloppyController {
         // TODO: media-less and motor-off drives should also arm and idle
         // (real Paula would wait for sync forever); they keep the instant
         // completion until the software relying on it is characterized.
-        if self.drives[idx].image.is_none() || !self.drives[idx].motor_on {
+        if !self.drives[idx].has_media() || !self.drives[idx].motor_on {
             if crate::envcfg::flag("COPPERLINE_DIAG_DISK") {
                 log::info!(
                     "disk-dma refused: df{idx} image={} motor_on={} motor_cck={}",
@@ -1555,6 +1634,19 @@ impl FloppyController {
     }
 
     fn ensure_track(&mut self, idx: usize, track: usize) {
+        // A physical drive has one head, and it is where the guest's stepper put
+        // it. `tick` asks for the DMA's track as well as the head's, and when a
+        // transfer outlives a step those two disagree -- so asking for both would
+        // drag the real head between them, tick after tick, reading nothing
+        // useful either way. Only fetch what the head is over; the transfer gets
+        // what is passing under it, as it would on hardware.
+        #[cfg(feature = "fluxdrive")]
+        if self.drives[idx].flux.is_some() {
+            if track == self.track_for_drive(idx) {
+                self.ensure_flux_track(idx, track);
+            }
+            return;
+        }
         let drive = &mut self.drives[idx];
         if drive.cached_track == Some(track) {
             return;
@@ -1565,6 +1657,111 @@ impl FloppyController {
                 drive.cached.revs = stream.revs;
             }
             drive.cached_track = Some(track);
+            drive.clamp_head();
+        }
+    }
+
+    /// Put the track under the head on the platter, reading it off the real disk
+    /// if it is not already known.
+    ///
+    /// Called from `tick`, so this runs millions of times a second while a
+    /// capture that takes a fifth of a second is outstanding. Nothing here may
+    /// block, and nothing may queue a second rotation's work.
+    #[cfg(feature = "fluxdrive")]
+    fn ensure_flux_track(&mut self, idx: usize, track: usize) {
+        let cylinder = (track / SIDES) as u8;
+        let head = crate::fluxdrive::Head::from_index(u8::from(!track.is_multiple_of(SIDES)));
+        let drive = &mut self.drives[idx];
+
+        // A real drive reads nothing until the platter is at speed, and drive
+        // select alone gets here with the motor still off.
+        let at_speed = drive.motor_on && drive.motor_cck >= MOTOR_READY_CCK;
+        let Some(flux) = drive.flux.as_mut() else {
+            return;
+        };
+        flux.set_motor(drive.motor_on);
+        if !at_speed {
+            log::trace!(
+                "floppy.df{idx} flux: not at speed (motor={} spun={}/{MOTOR_READY_CCK})",
+                drive.motor_on,
+                drive.motor_cck,
+            );
+            return;
+        }
+
+        // Collect whatever the drive has finished. It may be a track the head
+        // has since stepped away from, which is kept all the same: it cost a
+        // rotation to fetch and is still a good reading of that track, so the
+        // guest coming back to it finds it waiting.
+        while let Some(captured) = flux.poll() {
+            let captured_track =
+                usize::from(captured.cylinder) * SIDES + usize::from(captured.head.index());
+            let revs: Vec<TrackRev> = captured
+                .revolutions
+                .iter()
+                .map(|rev| {
+                    TrackRev::measured(rev.words.clone(), rev.bit_len as usize, &rev.bitcell_ns)
+                })
+                .collect();
+            if !revs.is_empty() {
+                let mean_cell_ns = captured
+                    .revolutions
+                    .first()
+                    .map(|r| r.mean_cell_ns())
+                    .unwrap_or_default();
+                debug!(
+                    "floppy.df{idx} track {captured_track} (cyl {} head {}) read: \
+                     {} revolutions, {} cells, {mean_cell_ns:.0} ns/cell",
+                    captured.cylinder,
+                    captured.head.index(),
+                    revs.len(),
+                    revs[0].bit_len,
+                );
+                if drive.flux_tracks.len() <= captured_track {
+                    drive.flux_tracks.resize(captured_track + 1, None);
+                }
+                drive.flux_tracks[captured_track] = Some(CachedTrack { revs });
+            }
+        }
+
+        // Read this track before? Hand back what it said then. It holds several
+        // whole revolutions and the head rings through them, so a guest that
+        // re-reads after a failed checksum meets freshly measured cells on the
+        // next turn -- which is the only way a marginal sector is ever recovered,
+        // and the only reason a re-read is worth anything.
+        if let Some(known) = drive.flux_tracks.get(track).and_then(Option::as_ref) {
+            if drive.cached_track != Some(track) {
+                drive.cached = known.clone();
+                drive.cached_track = Some(track);
+                drive.flux_filler_track = None;
+                drive.clamp_head();
+            }
+            return;
+        }
+
+        if flux.request(cylinder, head, FLUX_CAPTURE_REVOLUTIONS) {
+            debug!(
+                "floppy.df{idx} flux: reading track {track} (cyl {cylinder} head {})",
+                head.index()
+            );
+        }
+
+        // Keep the head over something while the capture runs. Stopping the
+        // platter would make the guest pay the capture and then its own
+        // rotational wait one after the other; turning filler means the two
+        // overlap, which is how a drive that has data the moment it arrives
+        // behaves. Index pulses keep coming either way, as they do on a drive
+        // whose platter is up to speed over a part of the disk it cannot read.
+        if drive.flux_filler_track != Some(track) {
+            let nominal = encoded_track_words();
+            drive.cached = CachedTrack {
+                revs: vec![TrackRev::filler(
+                    nominal * 16,
+                    Self::word_cck_for_track_words(nominal),
+                )],
+            };
+            drive.cached_track = None;
+            drive.flux_filler_track = Some(track);
             drive.clamp_head();
         }
     }
@@ -1636,6 +1833,21 @@ struct FloppyDrive {
     // Cumulative spin time, for the COPPERLINE_DISK_SPEED_AFTER gate (lets the disk
     // run at full speed through boot, then be slowed for the demo).
     elapsed_cck: u64,
+    // A real drive standing in for this bay's image. Not part of a save state:
+    // the disk in the drive is the machine's media, and no snapshot owns it.
+    #[cfg(feature = "fluxdrive")]
+    #[serde(skip)]
+    flux: Option<crate::fluxdrive::drive::FluxDrive>,
+    // Tracks read off the physical disk so far, by track number. Emptied when
+    // the disk changes, since nothing read from the old one still applies.
+    #[cfg(feature = "fluxdrive")]
+    #[serde(skip)]
+    flux_tracks: Vec<Option<CachedTrack>>,
+    // The track whose filler is currently turning under the head, so it is not
+    // rebuilt on every tick while a capture runs.
+    #[cfg(feature = "fluxdrive")]
+    #[serde(skip)]
+    flux_filler_track: Option<usize>,
 }
 
 impl Default for FloppyDrive {
@@ -1665,6 +1877,12 @@ impl Default for FloppyDrive {
             external_id_mode: false,
             external_id_hold_deactivate: false,
             elapsed_cck: 0,
+            #[cfg(feature = "fluxdrive")]
+            flux: None,
+            #[cfg(feature = "fluxdrive")]
+            flux_tracks: Vec::new(),
+            #[cfg(feature = "fluxdrive")]
+            flux_filler_track: None,
         }
     }
 }
@@ -1705,7 +1923,26 @@ impl FloppyDrive {
     }
 
     fn ready(&self) -> bool {
-        self.image.is_some() && self.motor_on && self.motor_cck >= MOTOR_READY_CCK
+        self.has_media() && self.motor_on && self.motor_cck >= MOTOR_READY_CCK
+    }
+
+    /// Whether there is anything for the head to read.
+    ///
+    /// A physical bay has no image: its media is the disk in the drive, and the
+    /// floppy bus has no line that reports one. It is taken to be there until
+    /// the drive says otherwise by turning nothing -- no index hole passing the
+    /// sensor, which is the same evidence a real controller goes on.
+    ///
+    /// Assuming a disk rather than waiting to prove one matters: `/RDY` gates
+    /// whether the guest's driver will read at all, and a driver that finds the
+    /// drive not ready concludes the slot is empty long before a first capture
+    /// could finish.
+    fn has_media(&self) -> bool {
+        #[cfg(feature = "fluxdrive")]
+        if let Some(flux) = self.flux.as_ref() {
+            return flux.disk_present().unwrap_or(true);
+        }
+        self.image.is_some()
     }
 
     fn rdy_line_asserted(&self) -> bool {
@@ -1756,7 +1993,7 @@ impl FloppyDrive {
         self.external_id_bit = 0;
         self.external_id_hold_deactivate = false;
         self.write_protected_sense = true;
-        if self.image.is_none() && self.external_id != 0 {
+        if !self.has_media() && self.external_id != 0 {
             self.assert_no_media_change();
         }
         self.status_settle_cck = DISK_STATUS_SETTLE_CCK;
@@ -1780,7 +2017,7 @@ impl FloppyDrive {
     fn step(&mut self, inward: bool) -> bool {
         // The change latch clears on the step PULSE itself (an electrical
         // edge), whether or not the mechanism accepts it.
-        if self.image.is_some() {
+        if self.has_media() {
             self.set_disk_change(false);
         }
         // The stepper ignores pulses spaced closer than the mechanism can
@@ -2034,20 +2271,86 @@ impl FloppyDrive {
 /// 16-bit word at this revolution's length; per-bit timing is derived so each
 /// aligned 16-bit group sums to exactly `word_cck`, keeping synthetic (ADF)
 /// word cadence identical to the old word-grid model.
+/// A revolution measured off a real disk carries `byte_cck` as well: the time
+/// the data separator actually measured, one entry per byte as a running total,
+/// so the cck at any position on the revolution is a lookup rather than a sum.
+/// A disk's rate varies through a revolution, and a track written at a
+/// deliberately odd rate varies a great deal, so the head is paced by what was
+/// measured rather than by an average.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct TrackRev {
     words: Vec<u16>,
     bit_len: usize,
     word_cck: u32,
+    #[serde(default)]
+    byte_cck: Option<Vec<u32>>,
 }
 
 impl TrackRev {
+    /// A revolution of unreadable cells, for a platter turning over a part of
+    /// the disk whose data has not arrived yet.
+    ///
+    /// All-ones carries no sync word, so the guest's shifter finds nothing and
+    /// waits, exactly as it would over an unformatted or unreached track --
+    /// rather than being handed plausible-looking rubbish to checksum.
+    #[cfg(feature = "fluxdrive")]
+    fn filler(bit_len: usize, word_cck: u32) -> Self {
+        Self {
+            words: vec![0xFFFF; bit_len.div_ceil(16)],
+            bit_len,
+            word_cck: word_cck.max(1),
+            byte_cck: None,
+        }
+    }
+
     fn new(words: Vec<u16>, bit_len: usize, word_cck: u32) -> Self {
         let bit_len = bit_len.min(words.len() * 16);
         Self {
             words,
             bit_len,
             word_cck: word_cck.max(1),
+            byte_cck: None,
+        }
+    }
+
+    /// A revolution with the cell timing the separator measured for it.
+    ///
+    /// `cell_ns` holds one measured duration per cell. They are accumulated a
+    /// byte at a time: the drive's rate cannot swing meaningfully inside eight
+    /// cells, and a running total per cell would cost several hundred KB a
+    /// revolution for no gain.
+    ///
+    /// `word_cck` is still set, from the same measurements, so anything that
+    /// reads the uniform rate sees this revolution's real average rather than a
+    /// nominal one.
+    fn measured(words: Vec<u16>, bit_len: usize, cell_ns: &[u32]) -> Self {
+        let bit_len = bit_len.min(words.len() * 16).min(cell_ns.len());
+        let bytes = bit_len / 8;
+        // Sum in nanoseconds and convert once, so rounding each cell to whole
+        // cck cannot accumulate across a hundred thousand of them.
+        let mut prefix = Vec::with_capacity(bytes + 1);
+        let mut acc_ns: u64 = 0;
+        let ns_to_cck =
+            |ns: u64| -> u32 { (ns * u64::from(PAULA_CLOCK_HZ) / 1_000_000_000) as u32 };
+        for byte in 0..bytes {
+            prefix.push(ns_to_cck(acc_ns));
+            for cell in 0..8 {
+                acc_ns += u64::from(cell_ns[byte * 8 + cell]);
+            }
+        }
+        prefix.push(ns_to_cck(acc_ns));
+
+        let revolution_cck = u64::from(ns_to_cck(acc_ns));
+        let word_cck = if bit_len == 0 {
+            1
+        } else {
+            (revolution_cck * 16 / bit_len as u64).max(1) as u32
+        };
+        Self {
+            words,
+            bit_len,
+            word_cck,
+            byte_cck: (bytes > 0).then_some(prefix),
         }
     }
 
@@ -2078,9 +2381,22 @@ impl TrackRev {
     }
 
     /// Cumulative cck from the start of the revolution to the start of `bit`.
-    /// `prefix(16k) == k*word_cck` exactly, so aligned word boundaries match
-    /// the old uniform word clock.
+    ///
+    /// With measured timing this is a lookup into the running total. Without it,
+    /// `prefix(16k) == k*word_cck` exactly, so aligned word boundaries match the
+    /// uniform word clock a synthetic (ADF) track is built on.
     fn prefix_cck(&self, bit: usize) -> u64 {
+        if let Some(prefix) = &self.byte_cck {
+            let byte = bit / 8;
+            // Past the end is the whole revolution, which `rev_cck` asks for.
+            if byte + 1 >= prefix.len() {
+                return u64::from(*prefix.last().unwrap_or(&0));
+            }
+            let start = u64::from(prefix[byte]);
+            let span = u64::from(prefix[byte + 1] - prefix[byte]);
+            // One measurement covers the byte, so its eight cells share it.
+            return start + (span * (bit % 8) as u64) / 8;
+        }
         (bit as u64 * self.word_cck as u64 + 8) / 16
     }
 
@@ -4041,6 +4357,7 @@ mod tests {
         }
         let path = temp_adz(&adf)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4072,6 +4389,7 @@ mod tests {
         let ext_image = fs::read(&ext_path)?;
         let path = temp_gzip("test.ext.adf.gz", &ext_image)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4110,6 +4428,7 @@ mod tests {
         image.extend_from_slice(&0u32.to_be_bytes());
         fs::write(&path, image)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4139,6 +4458,7 @@ mod tests {
         let first = temp_adf()?;
         let second = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4179,6 +4499,7 @@ mod tests {
         let first = temp_adf()?;
         let second = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4272,6 +4593,7 @@ mod tests {
         let protected = temp_adf()?;
         let writable = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4306,6 +4628,7 @@ mod tests {
     fn cia_status_reflects_write_protect_track0_and_ready() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4332,6 +4655,7 @@ mod tests {
     fn cia_status_ready_line_tracks_motor_spinup_and_off() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4398,6 +4722,7 @@ mod tests {
     fn side_select_maps_lower_head_to_even_adf_tracks() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4585,6 +4910,7 @@ mod tests {
     fn track_zero_line_follows_head_position() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4838,6 +5164,7 @@ mod tests {
     fn dskbytr_byte_valid_tracks_new_rotation_words() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -4878,6 +5205,7 @@ mod tests {
         let raw_words = [0x1234, 0xABCD];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5081,6 +5409,7 @@ mod tests {
         let raw_words = [0x1234, 0x5678];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5123,6 +5452,7 @@ mod tests {
         let raw_words = [DEFAULT_DSKSYNC, 0x5678];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5156,6 +5486,7 @@ mod tests {
         let raw_words = [DEFAULT_DSKSYNC, 0x5678];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5196,6 +5527,7 @@ mod tests {
         let raw_words = [0x1234, DEFAULT_DSKSYNC];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5245,6 +5577,7 @@ mod tests {
         let raw_words = [0x1234, 0x5678];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5279,6 +5612,7 @@ mod tests {
         let raw_words = [0x1234, 0x5678];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5311,6 +5645,7 @@ mod tests {
         let raw_words = [0x1234, 0x5678];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5356,6 +5691,7 @@ mod tests {
     ) -> Result<(FloppyController, PathBuf)> {
         let path = temp_ext2_raw(raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5522,6 +5858,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: SPEED_TURBO,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5558,6 +5895,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: SPEED_TURBO,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5594,6 +5932,7 @@ mod tests {
             let raw_words = [0x1234, 0x5678];
             let path = temp_ext2_raw(&raw_words)?;
             let cfg = FloppyConfig {
+                flux: std::array::from_fn(|_| None),
                 speed,
                 drives: [
                     Some(FloppyDriveConfig {
@@ -5625,6 +5964,7 @@ mod tests {
         let raw_words = [0x1234, 0x5678];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5677,6 +6017,7 @@ mod tests {
     fn dsksync_write_latches_current_word_match() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5706,6 +6047,7 @@ mod tests {
         let raw_words = [DEFAULT_DSKSYNC, 0x2222];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5737,6 +6079,7 @@ mod tests {
     fn read_dma_sync_irq_does_not_require_wordsync() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5779,6 +6122,7 @@ mod tests {
     fn wordsync_skips_initial_sync_then_transfers_repeated_sync_word() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5830,6 +6174,7 @@ mod tests {
         let raw_words = [0xAA44u16, 0x8955, 0x1234, 0x5678, 0x0000];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5876,6 +6221,7 @@ mod tests {
         let raw_words = [0x1111, DEFAULT_DSKSYNC, 0x2222];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5926,6 +6272,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -5972,6 +6319,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6018,6 +6366,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6059,6 +6408,7 @@ mod tests {
         let track2 = [0xAAAA, 0xBBBB];
         let path = temp_ext2_raw_tracks(&[(0, &track0), (2, &track2)])?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6112,6 +6462,7 @@ mod tests {
         let track0 = [0x1111u16, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw_tracks(&[(0, &track0)])?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6164,6 +6515,7 @@ mod tests {
         let raw_words = [0x1111, DEFAULT_DSKSYNC, 0x2222];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6207,6 +6559,7 @@ mod tests {
         let raw_words = [0x1111, DEFAULT_DSKSYNC, 0x2222];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6245,6 +6598,7 @@ mod tests {
         let raw_words = [0x1111, DEFAULT_DSKSYNC, 0x2222];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6290,6 +6644,7 @@ mod tests {
         let raw_words = [DEFAULT_DSKSYNC, 0x2222];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6333,6 +6688,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6373,6 +6729,7 @@ mod tests {
     fn selected_drive_index_pulse_latches_once_per_wrap() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6407,6 +6764,7 @@ mod tests {
     fn selected_drive_index_pulse_has_fixed_width() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6445,6 +6803,7 @@ mod tests {
     fn motor_off_drive_does_not_emit_index_pulse() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6475,6 +6834,7 @@ mod tests {
     fn next_index_pulse_reports_selected_drive_time() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6509,6 +6869,7 @@ mod tests {
         let raw_words = [0x4489, 0x2AAA, 0x5555, 0xA144];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6540,6 +6901,7 @@ mod tests {
     fn uae_extended_adf_raw_track_preserves_odd_byte_payload() -> Result<()> {
         let path = temp_ext2_track(1, 20, &[0x12, 0x34, 0xA0])?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6625,6 +6987,7 @@ mod tests {
         let raw_words: [u16; 4] = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw_revolutions(&raw_words, 32, 2)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6674,6 +7037,7 @@ mod tests {
         let raw_words = [0x4489, 0x2AAA];
         let path = temp_scp_raw_revolutions(&[&raw_words], 32)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6706,6 +7070,7 @@ mod tests {
     fn scp_flux_decode_resolves_variable_intervals_to_cells() -> Result<()> {
         let path = temp_scp_flux_entries(&[60, 100, 80], 3)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6742,6 +7107,7 @@ mod tests {
         let rev1 = [0x5555, 0xA144];
         let path = temp_scp_raw_revolutions(&[&rev0, &rev1], 32)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6794,6 +7160,7 @@ mod tests {
             SCP_FLAG_INDEX | SCP_FLAG_EXTENDED_MODE,
         )?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6828,6 +7195,7 @@ mod tests {
         fs::write(&path, &image)?;
 
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6860,6 +7228,7 @@ mod tests {
         let raw_words = [0x4489, 0x2AAA];
         let path = temp_scp_raw_revolutions_with_flags(&[&raw_words], 32, 0)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -6900,6 +7269,7 @@ mod tests {
         fs::write(&path, &image)?;
 
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7001,6 +7371,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7041,6 +7412,7 @@ mod tests {
         let raw_words = [0x4489];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7073,6 +7445,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7115,6 +7488,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7160,6 +7534,7 @@ mod tests {
         track_data[0..BYTES_PER_SECTOR].fill(0x5A);
         let path = temp_ext2_amigados(&track_data)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7194,6 +7569,7 @@ mod tests {
         payload.resize(0x31f0, 0);
         let path = temp_ext2_track(0, (track_data.len() * 8) as u32, &payload)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7253,6 +7629,7 @@ mod tests {
     fn writable_extended_adf_amigados_track_persists_sector_updates() -> Result<()> {
         let path = temp_ext2_amigados(&vec![0u8; SECTORS_PER_TRACK * BYTES_PER_SECTOR])?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7319,6 +7696,7 @@ mod tests {
             2,
         )?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7378,6 +7756,7 @@ mod tests {
         let raw_words = [0x4489, 0x2AAA, 0x5555, 0xA144];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7445,6 +7824,7 @@ mod tests {
         let raw_words = [0x0000, 0x0000, 0x0000, 0x0000];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7491,6 +7871,7 @@ mod tests {
         let raw_words = [0x0000, 0x0000];
         let path = temp_ext2_raw_revolutions(&raw_words, 20, 1)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7541,6 +7922,7 @@ mod tests {
     fn writable_extended_adf_raw_track_preserves_partial_word_tail() -> Result<()> {
         let path = temp_ext2_track(1, 20, &[0xFF, 0xFF, 0xF0])?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7595,6 +7977,7 @@ mod tests {
         let raw_words = [0xFFFF];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7640,6 +8023,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7685,6 +8069,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7732,6 +8117,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7789,6 +8175,7 @@ mod tests {
         let raw_words = [0x1111, 0x2222, 0x3333, 0x4444];
         let path = temp_ext2_raw(&raw_words)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7841,6 +8228,7 @@ mod tests {
         let track2 = [0xFFFF, 0xFFFF];
         let path = temp_ext2_raw_tracks(&[(0, &track0), (2, &track2)])?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7893,6 +8281,7 @@ mod tests {
     fn writable_legacy_extended_adf_raw_track_persists_word_stream() -> Result<()> {
         let path = temp_ext1_raw(&[0x4489, 0x1111, 0x2222])?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7949,6 +8338,7 @@ mod tests {
     fn writable_legacy_extended_adf_raw_track_overwrites_sync_boundary() -> Result<()> {
         let path = temp_ext1_raw(&[0x4489, 0x1111, 0x2222])?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -7999,6 +8389,7 @@ mod tests {
     fn writable_legacy_extended_adf_raw_track_preserves_odd_payload_length() -> Result<()> {
         let path = temp_ext1_raw_payload(0x4489, &[0x12, 0x34, 0xA0])?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -8048,6 +8439,7 @@ mod tests {
     fn write_dma_decodes_and_persists_track() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -8089,6 +8481,7 @@ mod tests {
     fn floppy_turbo_bursts_write_dma_and_persists_track() -> Result<()> {
         let path = temp_adf()?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: SPEED_TURBO,
             drives: [
                 Some(FloppyDriveConfig {
@@ -8229,6 +8622,7 @@ mod tests {
         let path = temp_path("full-track-dma-checksum.adf");
         fs::write(&path, &adf)?;
         let cfg = FloppyConfig {
+            flux: std::array::from_fn(|_| None),
             speed: 100,
             drives: [
                 Some(FloppyDriveConfig {
@@ -8309,7 +8703,11 @@ mod tests {
             path: adf.clone(),
             write_protected: true,
         });
-        let ctrl = FloppyController::from_config(&FloppyConfig { drives, speed: 100 })?;
+        let ctrl = FloppyController::from_config(&FloppyConfig {
+            drives,
+            flux: std::array::from_fn(|_| None),
+            speed: 100,
+        })?;
         assert!(ctrl.drive_connected(1));
         assert!(ctrl.disk_inserted(1));
         let _ = fs::remove_file(&adf);

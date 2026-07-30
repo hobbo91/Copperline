@@ -607,6 +607,17 @@ pub struct CommandError {
     pub code: u8,
 }
 
+impl CommandError {
+    /// Whether this failure means there is no disk in the drive.
+    ///
+    /// The floppy bus has no line for it. What a drive with an empty slot does
+    /// is turn nothing, so no index hole ever passes the sensor -- which is the
+    /// same evidence a real controller goes on.
+    pub fn means_no_disk(&self) -> bool {
+        self.code == ack::NO_INDEX
+    }
+}
+
 impl std::fmt::Display for CommandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

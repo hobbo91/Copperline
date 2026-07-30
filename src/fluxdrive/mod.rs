@@ -24,6 +24,7 @@ use anyhow::Result;
 
 pub mod amigados;
 pub mod cells;
+pub mod drive;
 pub mod greaseweazle;
 
 /// Which side of the disk the head is reading.

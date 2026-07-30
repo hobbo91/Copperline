@@ -1000,6 +1000,9 @@ impl Default for AudioConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FloppyConfig {
     pub drives: [Option<FloppyDriveConfig>; 4],
+    /// Physical drives, by bay. A bay with one here has no entry in `drives`:
+    /// the disk in the drive is its media.
+    pub flux: [Option<FloppyFluxConfig>; 4],
     /// Emulated drive speed as a data-rate percentage: 100 (real speed),
     /// 200/400/800 (that many times faster), or 0 for turbo, where DMA
     /// transfers complete almost instantly. Values above 100 keep the full
@@ -1012,6 +1015,7 @@ impl Default for FloppyConfig {
     fn default() -> Self {
         Self {
             drives: std::array::from_fn(|_| None),
+            flux: std::array::from_fn(|_| None),
             speed: 100,
         }
     }
@@ -1021,6 +1025,62 @@ impl Default for FloppyConfig {
 pub struct FloppyDriveConfig {
     pub path: PathBuf,
     pub write_protected: bool,
+}
+
+/// Which interface a physical drive is attached through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FluxInterface {
+    #[default]
+    Greaseweazle,
+}
+
+impl FluxInterface {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "greaseweazle" | "gw" => Some(Self::Greaseweazle),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Greaseweazle => "greaseweazle",
+        }
+    }
+}
+
+/// A real 3.5" drive attached to one floppy bay, from `[floppy.dfN] flux = ...`.
+///
+/// Held apart from [`FloppyDriveConfig`] because a physical drive has no image
+/// path: whichever of the two a bay has supplies its media.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloppyFluxConfig {
+    pub interface: FluxInterface,
+    /// Emulator-level write protection, on top of the disk's own tab. Defaults
+    /// to true, exactly as it does for an image, so writing to a real disk takes
+    /// a deliberate `write_protected = false` as well as the tab being open --
+    /// two independent things to get wrong before anything is laid on physical
+    /// media.
+    pub write_protected: bool,
+    /// `None` picks the only interface attached, and refuses to guess between
+    /// several.
+    pub port: Option<String>,
+    /// Which drive on the cable: `a`/`b` on a PC cable, `0`..`3` on Shugart.
+    pub cable: String,
+}
+
+impl Default for FloppyFluxConfig {
+    fn default() -> Self {
+        Self {
+            interface: FluxInterface::default(),
+            // Protected unless told otherwise, matching an image-backed drive.
+            // A derived `Default` would make this false and quietly hand out a
+            // writable real disk.
+            write_protected: true,
+            port: None,
+            cable: "a".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1641,6 +1701,19 @@ pub struct ConfigOverrides {
     /// Drive speed override (`--floppy-speed`): a percentage (100/200/400/
     /// 800) or 0 for turbo. Same values as `[floppy] speed`.
     pub floppy_speed: Option<u16>,
+    /// A real drive on a bay (`--floppy-flux DFN INTERFACE`), by bay. Same
+    /// values as `[floppy.dfN] flux`.
+    pub floppy_flux: [Option<String>; 4],
+    /// The interface's serial port (`--floppy-flux-port DFN PORT`). Same as
+    /// `[floppy.dfN] flux_port`; unset picks the only interface attached.
+    pub floppy_flux_port: [Option<String>; 4],
+    /// Which drive on the cable (`--floppy-flux-cable DFN CABLE`). Same as
+    /// `[floppy.dfN] flux_cable`.
+    pub floppy_flux_cable: [Option<String>; 4],
+    /// Let the emulator write to the physical disk (`--floppy-flux-writable
+    /// DFN`), leaving only the disk's own tab in the way. Same as
+    /// `[floppy.dfN] write_protected = false`.
+    pub floppy_flux_writable: [bool; 4],
     /// Initial joystick input mode (`--joystick`): "gamepad" or "keyboard"
     /// ("auto" still accepted as a compatibility alias). Validated by the same
     /// parser as `[input] joystick`.
@@ -1723,6 +1796,10 @@ impl ConfigOverrides {
             && self.accelerator.is_none()
             && self.floppy_drives.is_none()
             && self.floppy_speed.is_none()
+            && self.floppy_flux.iter().all(Option::is_none)
+            && self.floppy_flux_port.iter().all(Option::is_none)
+            && self.floppy_flux_cable.iter().all(Option::is_none)
+            && !self.floppy_flux_writable.iter().any(|w| *w)
             && self.joystick.is_none()
             && self.mouse_sensitivity.is_none()
             && self.mouse_capture.is_none()
@@ -1786,6 +1863,41 @@ impl ConfigOverrides {
         }
         if let Some(speed) = self.floppy_speed {
             raw.floppy.speed = Some(speed);
+        }
+        {
+            let bays = [
+                &mut raw.floppy.df0,
+                &mut raw.floppy.df1,
+                &mut raw.floppy.df2,
+                &mut raw.floppy.df3,
+            ];
+            for (idx, bay) in bays.into_iter().enumerate() {
+                let touched = self.floppy_flux[idx].is_some()
+                    || self.floppy_flux_port[idx].is_some()
+                    || self.floppy_flux_cable[idx].is_some()
+                    || self.floppy_flux_writable[idx];
+                if !touched {
+                    continue;
+                }
+                let bay = bay.get_or_insert_with(Default::default);
+                if let Some(interface) = &self.floppy_flux[idx] {
+                    bay.flux = Some(interface.clone());
+                    // A real drive replaces whatever image the file named for
+                    // this bay: they are alternatives, and the flag on the
+                    // command line is the later word.
+                    bay.path = None;
+                    bay.paths = None;
+                }
+                if let Some(port) = &self.floppy_flux_port[idx] {
+                    bay.flux_port = Some(port.clone());
+                }
+                if let Some(cable) = &self.floppy_flux_cable[idx] {
+                    bay.flux_cable = Some(cable.clone());
+                }
+                if self.floppy_flux_writable[idx] {
+                    bay.write_protected = Some(false);
+                }
+            }
         }
         if let Some(joystick) = &self.joystick {
             raw.input.joystick = Some(joystick.clone());
@@ -2551,6 +2663,16 @@ pub(crate) struct RawFloppyDrive {
     pub(crate) paths: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) write_protected: Option<bool>,
+    /// Drive a real 3.5" drive on this bay instead of an image, over a flux
+    /// interface: `greaseweazle`, or `off`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) flux: Option<String>,
+    /// The interface's serial port. Unset picks the only one attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) flux_port: Option<String>,
+    /// Which drive on the cable: `a`/`b` on a PC cable, `0`..`3` on Shugart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) flux_cable: Option<String>,
 }
 
 /// Convert a parsed `[ide]`/`[scsi]` drive entry into a `DriveImage`,
@@ -4059,10 +4181,62 @@ fn parse_floppy(raw: RawFloppy) -> Result<(FloppyConfig, [bool; 4], [Vec<PathBuf
         None => [true, false, false, false],
     };
     let mut playlists: [Vec<PathBuf>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut flux: [Option<FloppyFluxConfig>; 4] = std::array::from_fn(|_| None);
     for (idx, raw_drive) in raws.into_iter().enumerate() {
         let Some(raw_drive) = raw_drive else {
             continue;
         };
+
+        // A bay is either a real drive or an image, never both: the disk in the
+        // drive is its media, and there is nothing for an image to mean
+        // alongside it.
+        let wants_flux = match raw_drive.flux.as_deref().map(str::trim) {
+            None => None,
+            Some(value) if value.eq_ignore_ascii_case("off") => None,
+            Some(value) => match FluxInterface::parse(value) {
+                Some(interface) => Some(interface),
+                None => bail!(
+                    "floppy.df{idx} flux = \"{value}\" is not a known interface; \
+                     expected \"greaseweazle\" or \"off\""
+                ),
+            },
+        };
+        if let Some(interface) = wants_flux {
+            if raw_drive.path.is_some() || raw_drive.paths.is_some() {
+                bail!(
+                    "floppy.df{idx} has both a real drive and an image; \
+                     a bay takes one or the other"
+                );
+            }
+            if raw_drive.enabled == Some(false) {
+                continue;
+            }
+            if let Some(count) = connected_count {
+                if !connected[idx] {
+                    bail!(
+                        "[floppy] drives = {count} leaves floppy.df{idx} disconnected, \
+                         but floppy.df{idx} has a real drive configured"
+                    );
+                }
+            } else {
+                connected[idx] = true;
+            }
+            let cable = raw_drive.flux_cable.unwrap_or_else(|| "a".to_string());
+            validate_flux_cable(idx, &cable)?;
+            flux[idx] = Some(FloppyFluxConfig {
+                interface,
+                write_protected: raw_drive.write_protected.unwrap_or(true),
+                port: raw_drive.flux_port.filter(|p| !p.trim().is_empty()),
+                cable,
+            });
+            continue;
+        }
+        if raw_drive.flux_port.is_some() || raw_drive.flux_cable.is_some() {
+            bail!(
+                "floppy.df{idx} configures a flux interface but has no \
+                 flux = \"greaseweazle\""
+            );
+        }
         // Combine `path` (single) and `paths` (playlist) into one ordered
         // list, with `path` first when both are present.
         let mut raw_images: Vec<String> = Vec::new();
@@ -4108,7 +4282,27 @@ fn parse_floppy(raw: RawFloppy) -> Result<(FloppyConfig, [bool; 4], [Vec<PathBuf
         });
         playlists[idx] = images;
     }
-    Ok((FloppyConfig { drives, speed }, connected, playlists))
+    Ok((
+        FloppyConfig {
+            drives,
+            flux,
+            speed,
+        },
+        connected,
+        playlists,
+    ))
+}
+
+/// Check a cable position names a drive the interface can select, so a typo is
+/// caught before the interface is opened rather than after.
+fn validate_flux_cable(idx: usize, cable: &str) -> Result<()> {
+    match cable.trim().to_ascii_lowercase().as_str() {
+        "a" | "b" | "0" | "1" | "2" | "3" => Ok(()),
+        other => bail!(
+            "floppy.df{idx} flux_cable = \"{other}\" is not a drive position; \
+             expected \"a\" or \"b\" (PC cable), or \"0\"..\"3\" (Shugart)"
+        ),
+    }
 }
 
 fn validate_floppy_image_path(idx: usize, path: &Path) -> Result<()> {
@@ -4641,6 +4835,7 @@ mod tests {
                     path: Some("game.adf".to_string()),
                     paths: None,
                     write_protected: Some(true),
+                    ..RawFloppyDrive::default()
                 }),
                 ..RawFloppy::default()
             },

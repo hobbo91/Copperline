@@ -1,0 +1,309 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! A physical drive driven from the emulated machine, without stalling it.
+//!
+//! Reading a track off a real disk costs at least one rotation -- around 200 ms,
+//! and more for several revolutions -- which is an eternity to a machine being
+//! emulated in step with its own clocks. So the drive lives on its own thread:
+//! the emulated side asks for the track under the head and carries on, and
+//! collects the flux when it arrives.
+//!
+//! What the emulated machine does in the meantime is turn the platter with
+//! nothing readable on it, which is what a real drive does while the head is
+//! over a part of the disk it has not reached yet. The alternative -- stopping
+//! the platter until the capture lands -- would make the guest wait out the
+//! capture and then its own rotational latency afterwards, one after the other.
+//!
+//! Head position and motor state are not decided here. They follow the guest's
+//! stepper and CIA-B writes, so this thread only ever does as it is told.
+
+use super::cells::{recover_cells, RecoveredTrack};
+use super::{FluxSource, Head};
+use anyhow::{anyhow, Result};
+use log::{debug, warn};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::thread::JoinHandle;
+
+/// What the emulated side asks the drive to do.
+enum Command {
+    Motor(bool),
+    Capture {
+        cylinder: u8,
+        head: Head,
+        revolutions: u8,
+    },
+    Stop,
+}
+
+/// One track's worth of flux, recovered into cells.
+pub struct CapturedTrack {
+    pub cylinder: u8,
+    pub head: Head,
+    /// Each whole index-to-index revolution, decoded on its own. A marginal
+    /// sector often reads on one and not another, which is what lets the
+    /// guest's own re-read recover it.
+    pub revolutions: Vec<RecoveredTrack>,
+}
+
+/// What comes back from the drive's thread.
+enum Event {
+    Captured(Box<CapturedTrack>),
+    Failed {
+        cylinder: u8,
+        head: Head,
+        error: String,
+        /// The failure was "no index pulse", which is what an empty drive looks
+        /// like: nothing is turning for the sensor to see.
+        no_disk: bool,
+    },
+}
+
+/// A physical drive, asked for tracks and answered asynchronously.
+pub struct FluxDrive {
+    commands: Sender<Command>,
+    events: Receiver<Event>,
+    worker: Option<JoinHandle<()>>,
+    description: String,
+    /// The capture in flight, if any. Only one is ever outstanding: the
+    /// emulated side asks for the track under the head thousands of times a
+    /// second, and every one of those must not become a queued rotation.
+    pending: Option<(u8, Head)>,
+    motor_on: bool,
+    /// Whether a disk has been established to be in the drive. `None` until
+    /// something is read or fails in a way that settles it, because the floppy
+    /// bus never says outright.
+    disk_present: Option<bool>,
+    /// Set when the thread has gone, so the bay can stop asking.
+    lost: bool,
+}
+
+impl FluxDrive {
+    /// Take over a drive and put it on its own thread.
+    pub fn attach(mut source: Box<dyn FluxSource + Send>) -> Self {
+        let description = source.describe();
+        let (commands, command_rx) = std::sync::mpsc::channel::<Command>();
+        let (event_tx, events) = std::sync::mpsc::channel::<Event>();
+
+        let worker = std::thread::Builder::new()
+            .name("fluxdrive".to_string())
+            .spawn(move || {
+                while let Ok(command) = command_rx.recv() {
+                    match command {
+                        Command::Stop => break,
+                        Command::Motor(on) => {
+                            if let Err(err) = source.motor(on) {
+                                warn!("fluxdrive: cannot switch the drive motor: {err:#}");
+                            }
+                        }
+                        Command::Capture {
+                            cylinder,
+                            head,
+                            revolutions,
+                        } => {
+                            let outcome = capture(source.as_mut(), cylinder, head, revolutions);
+                            let event = match outcome {
+                                Ok(track) => Event::Captured(Box::new(track)),
+                                Err(err) => {
+                                    let no_disk = err
+                                        .downcast_ref::<super::greaseweazle::CommandError>()
+                                        .is_some_and(|e| e.means_no_disk());
+                                    Event::Failed {
+                                        cylinder,
+                                        head,
+                                        error: format!("{err:#}"),
+                                        no_disk,
+                                    }
+                                }
+                            };
+                            // A closed channel means the machine is gone; stop
+                            // touching the disk.
+                            if event_tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Leave the drive as it was found rather than spinning on.
+                if let Err(err) = source.motor(false) {
+                    debug!("fluxdrive: cannot stop the drive motor on shutdown: {err:#}");
+                }
+            })
+            .expect("spawn the flux drive thread");
+
+        Self {
+            commands,
+            events,
+            worker: Some(worker),
+            description,
+            pending: None,
+            motor_on: false,
+            disk_present: None,
+            lost: false,
+        }
+    }
+
+    pub fn describe(&self) -> &str {
+        &self.description
+    }
+
+    /// Whether a disk has been established to be in the drive, or `None` while
+    /// that is still unknown.
+    pub fn disk_present(&self) -> Option<bool> {
+        self.disk_present
+    }
+
+    /// Whether the drive's thread has gone, in which case nothing more will
+    /// come back from it.
+    pub fn lost(&self) -> bool {
+        self.lost
+    }
+
+    /// Spin the disk up or down, as the guest's CIA-B writes say.
+    pub fn set_motor(&mut self, on: bool) {
+        if self.motor_on == on || self.lost {
+            return;
+        }
+        self.motor_on = on;
+        if self.commands.send(Command::Motor(on)).is_err() {
+            self.lost = true;
+        }
+    }
+
+    pub fn motor_on(&self) -> bool {
+        self.motor_on
+    }
+
+    /// Whether a capture is already in flight.
+    pub fn busy(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Ask for the track under the head.
+    ///
+    /// Does nothing while another capture is outstanding, or with the motor off:
+    /// a stopped disk produces no flux. Returns whether the drive was actually
+    /// asked.
+    pub fn request(&mut self, cylinder: u8, head: Head, revolutions: u8) -> bool {
+        if self.lost || self.pending.is_some() || !self.motor_on {
+            return false;
+        }
+        let command = Command::Capture {
+            cylinder,
+            head,
+            revolutions,
+        };
+        if self.commands.send(command).is_err() {
+            self.lost = true;
+            return false;
+        }
+        self.pending = Some((cylinder, head));
+        true
+    }
+
+    /// Collect a finished capture, if one has arrived. Never blocks.
+    ///
+    /// What comes back is whatever the drive was asked for, which is not
+    /// necessarily the track under the head any more: the guest steps while the
+    /// disk is turning. It is returned regardless and tagged with the track it
+    /// belongs to, because those cells cost a rotation of real time to fetch and
+    /// remain a perfectly good reading of that track whether or not the head is
+    /// still over it.
+    pub fn poll(&mut self) -> Option<Box<CapturedTrack>> {
+        loop {
+            match self.events.try_recv() {
+                Ok(Event::Captured(track)) => {
+                    self.pending = None;
+                    // Flux came back, so something is turning in there.
+                    self.disk_present = Some(true);
+                    return Some(track);
+                }
+                Ok(Event::Failed {
+                    cylinder,
+                    head,
+                    error,
+                    no_disk,
+                }) => {
+                    self.pending = None;
+                    if no_disk {
+                        self.disk_present = Some(false);
+                    }
+                    // Not fatal on its own: a disk still coming up to speed
+                    // reads again next time.
+                    debug!(
+                        "fluxdrive: cylinder {cylinder} head {} did not read: {error}",
+                        head.index()
+                    );
+                }
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    self.lost = true;
+                    self.pending = None;
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Seek, read, and recover cells, all on the drive's own thread so the emulated
+/// machine never waits for a rotation.
+fn capture(
+    source: &mut (dyn FluxSource + Send),
+    cylinder: u8,
+    head: Head,
+    revolutions: u8,
+) -> Result<CapturedTrack> {
+    source.seek(cylinder)?;
+    source.select_head(head)?;
+    let flux = source.read_flux(revolutions)?;
+
+    let recovered: Vec<RecoveredTrack> = (0..flux.revolutions())
+        .filter_map(|rev| {
+            let revolution = flux.revolution(rev)?;
+            match recover_cells(&revolution, flux.ticks_per_sec) {
+                Ok(cells) => Some(cells),
+                Err(err) => {
+                    debug!("fluxdrive: revolution {rev} yielded no cells: {err:#}");
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if recovered.is_empty() {
+        return Err(anyhow!(
+            "cylinder {cylinder} head {} produced no usable revolution",
+            head.index()
+        ));
+    }
+    Ok(CapturedTrack {
+        cylinder,
+        head,
+        revolutions: recovered,
+    })
+}
+
+impl Drop for FluxDrive {
+    fn drop(&mut self) {
+        let _ = self.commands.send(Command::Stop);
+        if let Some(worker) = self.worker.take() {
+            // A capture already under way finishes first; it is one rotation,
+            // and abandoning the thread mid-command would leave the interface
+            // half-way through a command with the port still open.
+            if worker.join().is_err() {
+                warn!("fluxdrive: the drive thread did not shut down cleanly");
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for FluxDrive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FluxDrive")
+            .field("drive", &self.description)
+            .field("motor_on", &self.motor_on)
+            .field("pending", &self.pending)
+            .field("lost", &self.lost)
+            .finish()
+    }
+}

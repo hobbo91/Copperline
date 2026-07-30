@@ -463,6 +463,35 @@ where
                 })?;
                 overrides.floppy_speed = Some(parse_floppy_speed(&value)?);
             }
+            #[cfg(feature = "fluxdrive")]
+            "--floppy-flux" => {
+                const USAGE: &str = "--floppy-flux requires DFN INTERFACE (greaseweazle, or off)";
+                let (drive_s, interface) = two_values(&mut args, USAGE)?;
+                let idx = parse_floppy_drive_idx(&drive_s, "--floppy-flux")?;
+                overrides.floppy_flux[idx] = Some(interface);
+            }
+            #[cfg(feature = "fluxdrive")]
+            "--floppy-flux-port" => {
+                const USAGE: &str = "--floppy-flux-port requires DFN PORT";
+                let (drive_s, port) = two_values(&mut args, USAGE)?;
+                let idx = parse_floppy_drive_idx(&drive_s, "--floppy-flux-port")?;
+                overrides.floppy_flux_port[idx] = Some(port);
+            }
+            #[cfg(feature = "fluxdrive")]
+            "--floppy-flux-cable" => {
+                const USAGE: &str = "--floppy-flux-cable requires DFN CABLE \
+                                     (a or b for a PC cable, 0..3 for Shugart)";
+                let (drive_s, cable) = two_values(&mut args, USAGE)?;
+                let idx = parse_floppy_drive_idx(&drive_s, "--floppy-flux-cable")?;
+                overrides.floppy_flux_cable[idx] = Some(cable);
+            }
+            #[cfg(feature = "fluxdrive")]
+            "--floppy-flux-writable" => {
+                const USAGE: &str = "--floppy-flux-writable requires DFN";
+                let drive_s = args.next().ok_or_else(|| anyhow!(USAGE))?;
+                let idx = parse_floppy_drive_idx(&drive_s, "--floppy-flux-writable")?;
+                overrides.floppy_flux_writable[idx] = true;
+            }
             "--rtc-time" => {
                 overrides.rtc_time = Some(args.next().ok_or_else(|| {
                     anyhow!("--rtc-time requires Unix seconds or \"YYYY-MM-DD HH:MM[:SS]\"")
@@ -1156,6 +1185,18 @@ fn parse_floppy_drive_idx(s: &str, option: &str) -> Result<usize> {
     Ok(idx)
 }
 
+/// Take the two values a per-bay option needs, failing with one usage message
+/// rather than two half-explained ones.
+#[cfg(feature = "fluxdrive")]
+fn two_values(
+    args: &mut impl Iterator<Item = String>,
+    usage: &'static str,
+) -> Result<(String, String)> {
+    let first = args.next().ok_or_else(|| anyhow!(usage))?;
+    let second = args.next().ok_or_else(|| anyhow!(usage))?;
+    Ok((first, second))
+}
+
 fn parse_floppy_speed(s: &str) -> Result<u16> {
     const MSG: &str = "--floppy-speed PERCENT must be 100, 200, 400, 800, or 0 (turbo)";
     let speed: u16 = s.trim().parse().map_err(|_| anyhow!(MSG))?;
@@ -1766,7 +1807,20 @@ fn main() -> Result<()> {
         || cli.benchmark_until.is_some()
         || cli.gdb.is_some()
         || cli.control.is_some();
-    let paced = !headless_capture;
+    // A bay driving a real drive pins the machine to wall-clock time, headless
+    // or not. The disk turns at 300 rpm in the world, not in emulated time, so a
+    // machine running faster than real time asks for tracks the drive cannot
+    // have reached yet -- and one running slower would hold a finished capture
+    // until the head had gone past it. This also means such a run is not
+    // reproducible, unlike every other headless run.
+    #[cfg(feature = "fluxdrive")]
+    let physical_drive = cfg.floppy.flux.iter().any(Option::is_some);
+    #[cfg(not(feature = "fluxdrive"))]
+    let physical_drive = false;
+    let paced = !headless_capture || physical_drive;
+    if physical_drive && headless_capture {
+        info!("floppy: a physical drive paces this run to wall-clock time; it is not reproducible");
+    }
     info!("emulation timing: deterministic core, paced={paced}");
     let mut emu = emulator::build_machine(&cfg, audio, paced, cli.load_state.is_some())?;
     if let Some(path) = &cli.load_state {

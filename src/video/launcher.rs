@@ -976,6 +976,9 @@ pub struct MachineSetup {
     /// image is a one-element list.
     df_playlists: [Vec<PathBuf>; 4],
     df_write_protected: [bool; 4],
+    /// A bay driving a real drive instead of an image. Mutually exclusive with
+    /// that bay's playlist: the disk in the drive is its media.
+    df_flux: [Option<crate::config::FloppyFluxConfig>; 4],
     // Hard disk. Each drive's optional volume-name override (directory mounts
     // only) sits in the matching `*_name` slot, paralleling the path slot. Boot
     // priority is edited on the Boot Priority sub-page and split across two
@@ -1116,11 +1119,15 @@ impl MachineSetup {
     pub fn from_raw(raw: &RawConfig) -> Result<Self> {
         let cfg: Config = raw.clone().try_into()?;
         let df_write_protected = std::array::from_fn(|i| {
+            // A bay with a real drive carries its own protection flag; the two
+            // sources are mutually exclusive, so whichever is present wins.
             cfg.floppy.drives[i]
                 .as_ref()
                 .map(|d| d.write_protected)
+                .or_else(|| cfg.floppy.flux[i].as_ref().map(|f| f.write_protected))
                 .unwrap_or(true)
         });
+        let df_flux = cfg.floppy.flux.clone();
         let connected = cfg.floppy_connected.iter().filter(|&&c| c).count().max(1) as u8;
         Ok(Self {
             model: cfg.machine,
@@ -1148,6 +1155,7 @@ impl MachineSetup {
             floppy_speed: cfg.floppy.speed,
             df_playlists: cfg.floppy_playlists.clone(),
             df_write_protected,
+            df_flux,
             ide_master: cfg.ide.master.as_ref().map(|d| d.path.clone()),
             ide_master_name: cfg.ide.master.as_ref().and_then(|d| d.volume_name.clone()),
             ide_master_bootpri: boot_priority_of(raw.ide.master.as_ref().and_then(|d| d.bootpri)),
@@ -1673,6 +1681,21 @@ impl MachineSetup {
     }
 
     fn floppy_drive_raw(&self, idx: usize) -> Option<RawFloppyDrive> {
+        // A real drive on this bay replaces the image entirely, so it is written
+        // instead of a path rather than alongside one.
+        if let Some(flux) = self.df_flux[idx].as_ref() {
+            return Some(RawFloppyDrive {
+                enabled: None,
+                path: None,
+                paths: None,
+                write_protected: (!self.df_write_protected[idx]).then_some(false),
+                flux: Some(flux.interface.label().to_string()),
+                flux_port: flux.port.clone(),
+                // The usual position of a lone drive on a PC cable is the
+                // default, so only an unusual one is written.
+                flux_cable: (flux.cable != "a").then(|| flux.cable.clone()),
+            });
+        }
         let playlist = &self.df_playlists[idx];
         if playlist.is_empty() {
             // A write-protect flag on an empty drive is meaningless, so an
@@ -1687,6 +1710,9 @@ impl MachineSetup {
             // write_protected defaults to true; only an unprotected drive is
             // written explicitly.
             write_protected: (!self.df_write_protected[idx]).then_some(false),
+            flux: None,
+            flux_port: None,
+            flux_cable: None,
         })
     }
 

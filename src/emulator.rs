@@ -1930,6 +1930,45 @@ fn open_scsi_target(
     }
 }
 
+/// Open every configured flux interface and hand its drive to its floppy bay.
+///
+/// A bay with a real drive on it has no image, so a failure here is fatal rather
+/// than something to carry on past: the machine would boot with a drive that
+/// looks wired but has nothing behind it.
+#[cfg(feature = "fluxdrive")]
+fn attach_flux_drives(floppy: &mut FloppyController, cfg: &Config) -> Result<()> {
+    use crate::config::FluxInterface;
+    use crate::fluxdrive::drive::FluxDrive;
+    use crate::fluxdrive::greaseweazle::{DriveSelect, Greaseweazle};
+    use anyhow::Context as _;
+
+    for (idx, flux_cfg) in cfg.floppy.flux.iter().enumerate() {
+        let Some(flux_cfg) = flux_cfg else { continue };
+        let source = match flux_cfg.interface {
+            FluxInterface::Greaseweazle => {
+                let select = DriveSelect::parse(&flux_cfg.cable).with_context(|| {
+                    format!("floppy.df{idx}: {} is not a drive position", flux_cfg.cable)
+                })?;
+                Greaseweazle::open(flux_cfg.port.as_deref(), select)
+                    .with_context(|| format!("floppy.df{idx}: cannot open the physical drive"))?
+            }
+        };
+        let drive = FluxDrive::attach(Box::new(source));
+        info!(
+            "floppy.df{idx} physical drive attached: {}",
+            drive.describe()
+        );
+        if flux_cfg.write_protected {
+            info!(
+                "floppy.df{idx} write-protected by the configuration; \
+                 set write_protected = false to write to the disk"
+            );
+        }
+        floppy.attach_flux_drive(idx, drive, flux_cfg.write_protected)?;
+    }
+    Ok(())
+}
+
 pub fn build_machine(
     cfg: &Config,
     audio: Box<dyn AudioSink>,
@@ -2118,6 +2157,8 @@ pub fn build_machine(
     };
     let mut floppy = FloppyController::from_config(&cfg.floppy)?;
     floppy.set_connected_drives(cfg.floppy_connected);
+    #[cfg(feature = "fluxdrive")]
+    attach_flux_drives(&mut floppy, cfg)?;
     let serial = build_serial_sink(cfg)?;
     let mut paula = Paula::new(serial, audio);
     paula
