@@ -293,6 +293,17 @@ impl FluxDrive {
         self.disk_present
     }
 
+    /// Whether finding a disk needs the drive spun up and read.
+    ///
+    /// False where the change line is believed: the guest's own polling clears
+    /// that latch, so asking costs nothing and takes no time. Probing does both
+    /// -- it holds the drive for most of a second while it spins and reads, and
+    /// anything the guest asked for meanwhile waits behind it, which for a drive
+    /// being polled means its steps arrive in a clump instead of evenly.
+    pub fn needs_probe(&self) -> bool {
+        !self.trust_change_pin
+    }
+
     /// Whether the drive's thread has gone, in which case nothing more will
     /// come back from it.
     pub fn lost(&self) -> bool {

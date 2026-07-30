@@ -1797,6 +1797,7 @@ impl FloppyController {
                 }
                 (flux.disk_present(), flux.write_protected())
             };
+            let needs_probe = drive.flux.as_ref().is_some_and(|f| f.needs_probe());
 
             // The change line says an empty slot and a just-swapped disk with the
             // same signal, so when it reports nothing there, ask the disk itself
@@ -1807,7 +1808,7 @@ impl FloppyController {
             // going in, so an unknown that is never asked about stays unknown,
             // and the machine goes on believing a drive it has never read is
             // loaded.
-            if sensed_media != Some(true) && due_probe {
+            if needs_probe && sensed_media != Some(true) && due_probe {
                 drive.flux_probe_cck = now + FLUX_PROBE_INTERVAL_CCK;
                 if let Some(flux) = drive.flux.as_mut() {
                     flux.probe_for_disk();
