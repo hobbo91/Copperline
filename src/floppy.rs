@@ -725,8 +725,15 @@ impl FloppyController {
                     }
                 }
                 // With no disk in it, send the real head after the emulated
-                // one. This is the empty-drive click: the guest polls for a
-                // disk by stepping, and a real mechanism answers audibly.
+                // one, one step for one step.
+                //
+                // This is where the empty-drive click comes from, and it comes
+                // from the guest: its trackdisk recalibrates and steps about
+                // while polling for a disk, and the mechanism answers audibly
+                // because the head really moves. A step outward at cylinder 0
+                // moves nothing and is silent, on a real drive exactly as here,
+                // so nothing may manufacture movement to make a noise -- the
+                // sound is whatever the guest actually asked the head to do.
                 //
                 // Only with no disk, though. While there is one, head movement
                 // belongs to the capture, which the interface precedes with its

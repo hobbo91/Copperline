@@ -374,7 +374,22 @@ impl Greaseweazle {
             // bounds imposed by per-command deadlines on top.
             .timeout(Duration::from_millis(200))
             .open()
-            .with_context(|| format!("cannot open Greaseweazle on {port_name}"))?;
+            .map_err(|err| {
+                // Only one program can have the interface at a time, and the
+                // usual reason is another Copperline still holding it. Say so:
+                // a machine that cannot open the drive otherwise looks exactly
+                // like one with an empty drive.
+                if err.kind() == serialport::ErrorKind::Io(ErrorKind::ResourceBusy)
+                    || err.to_string().contains("busy")
+                {
+                    anyhow!(
+                        "the Greaseweazle on {port_name} is already in use -- another \
+                         Copperline, or another tool, still has it open"
+                    )
+                } else {
+                    anyhow!("cannot open Greaseweazle on {port_name}: {err}")
+                }
+            })?;
 
         let mut gw = Self {
             port,
