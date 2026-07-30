@@ -1058,8 +1058,8 @@ impl FluxInterface {
 /// revolutions means a slower read that fails less often.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FluxMode {
-    /// Five readings of every track, and nothing fetched that was not asked
-    /// for. For a disk that is failing, or one being read once and carefully.
+    /// Five readings of every track. For a disk that is failing, or one being
+    /// read once and carefully.
     Slowest,
     /// Three readings. For a disk giving trouble without being bad enough to
     /// want the slowest setting.
@@ -1097,16 +1097,6 @@ impl FluxMode {
             Self::Fast => "fast",
             Self::Turbo => "turbo",
         }
-    }
-
-    /// Whether to read the other side of a cylinder while the head is there.
-    ///
-    /// On for everything but the most cautious setting. It costs no head
-    /// movement and fetches what a disk being read in order asks for next, so
-    /// the only reason to decline is wanting the drive to do nothing it was not
-    /// asked to.
-    pub fn reads_ahead(self) -> bool {
-        !matches!(self, Self::Slowest)
     }
 
     /// Whether to check the head is where it is believed to be after a seek.

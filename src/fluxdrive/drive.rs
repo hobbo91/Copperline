@@ -92,6 +92,8 @@ pub struct FluxDrive {
     disk_present: Option<bool>,
     /// The disk's own write-protect tab, as the drive senses it.
     write_protected: Option<bool>,
+    /// The outstanding capture was guessed at rather than asked for.
+    pending_speculative: bool,
     /// A status read is outstanding, so another would only queue behind it.
     status_pending: bool,
     probe_pending: bool,
@@ -226,6 +228,7 @@ impl FluxDrive {
             motor_on: false,
             disk_present: None,
             write_protected: None,
+            pending_speculative: false,
             status_pending: false,
             probe_pending: false,
             trust_change_pin,
@@ -335,6 +338,25 @@ impl FluxDrive {
     /// Does nothing while another capture is outstanding, or with the motor off:
     /// a stopped disk produces no flux. Returns whether the drive was actually
     /// asked.
+    /// Fetch a track nobody has asked for yet, guessing it will be wanted.
+    ///
+    /// Identical to a demanded fetch except that it is remembered as a guess, so
+    /// a demand that turns up for a different track can be told it was made to
+    /// wait by one -- and stop the guessing until the pattern settles.
+    pub fn request_speculative(&mut self, cylinder: u8, head: Head, revolutions: u8) -> bool {
+        if !self.request(cylinder, head, revolutions) {
+            return false;
+        }
+        self.pending_speculative = true;
+        true
+    }
+
+    /// What the outstanding capture is for, and whether it was guessed at.
+    pub fn pending(&self) -> Option<(u8, Head, bool)> {
+        self.pending
+            .map(|(cylinder, head)| (cylinder, head, self.pending_speculative))
+    }
+
     pub fn request(&mut self, cylinder: u8, head: Head, revolutions: u8) -> bool {
         if self.lost || self.pending.is_some() || !self.motor_on {
             return false;
@@ -352,6 +374,7 @@ impl FluxDrive {
         // the head or the next step would be thought already sent.
         self.sent_cylinder = Some(cylinder);
         self.pending = Some((cylinder, head));
+        self.pending_speculative = false;
         true
     }
 
@@ -368,6 +391,7 @@ impl FluxDrive {
             match self.events.try_recv() {
                 Ok(Event::Captured(track)) => {
                     self.pending = None;
+                    self.pending_speculative = false;
                     // Flux came back, so something is turning in there.
                     self.disk_present = Some(true);
                     return Some(track);
@@ -407,6 +431,7 @@ impl FluxDrive {
                     no_disk,
                 }) => {
                     self.pending = None;
+                    self.pending_speculative = false;
                     if no_disk {
                         self.disk_present = Some(false);
                     }
