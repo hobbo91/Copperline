@@ -29,9 +29,6 @@ use std::thread::JoinHandle;
 /// What the emulated side asks the drive to do.
 enum Command {
     Motor(bool),
-    /// A step pulse the mechanism swallowed: no movement, but the drive's
-    /// disk-change latch resets on the electrical edge all the same.
-    StepPulse,
     /// The guest has moved its head; go to wherever it is now.
     ///
     /// Carries no cylinder of its own on purpose. The guest steps every 3 ms and
@@ -149,11 +146,6 @@ impl FluxDrive {
                                 motor_running = on;
                             }
                         }
-                        Command::StepPulse => {
-                            if let Err(err) = source.step_pulse() {
-                                debug!("fluxdrive: cannot emit a step pulse: {err:#}");
-                            }
-                        }
                         Command::Seek => {
                             let cylinder = worker_target.load(Ordering::Relaxed);
                             // A step that will not go through is not worth
@@ -249,20 +241,6 @@ impl FluxDrive {
             lost: false,
             stopping,
             target_cylinder,
-        }
-    }
-
-    /// Pass on a step pulse that moved nothing.
-    ///
-    /// Skipped while a capture is outstanding: the pulse is only wanted when the
-    /// guest is polling an idle drive, and it would otherwise sit in front of a
-    /// read that is waiting.
-    pub fn step_pulse(&mut self) {
-        if self.lost || self.pending.is_some() {
-            return;
-        }
-        if self.commands.send(Command::StepPulse).is_err() {
-            self.lost = true;
         }
     }
 
@@ -396,6 +374,12 @@ impl FluxDrive {
                 }
                 Ok(Event::Probed(present)) => {
                     self.probe_pending = false;
+                    if self.disk_present != Some(present) {
+                        log::info!(
+                            "fluxdrive: probe found {}",
+                            if present { "a disk" } else { "no disk" }
+                        );
+                    }
                     self.disk_present = Some(present);
                 }
                 Ok(Event::Status(status)) => {

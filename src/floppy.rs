@@ -713,6 +713,12 @@ impl FloppyController {
                 // the wrong way on the first move after a direction change.
                 let inward = val & CIAB_DSKDIREC == 0;
                 let stepper_fired = self.drives[idx].step(inward);
+                log::trace!(
+                    "floppy.df{idx} step {} -> cyl {} (fired={stepper_fired}, media={})",
+                    if inward { "in" } else { "out" },
+                    self.drives[idx].cylinder,
+                    self.drives[idx].has_media(),
+                );
                 self.handle_active_dma_track_change(idx);
                 // Only pulses that reach the stepper are audible.
                 // Trackdisk's no-disk change-line polling makes the
@@ -731,25 +737,28 @@ impl FloppyController {
                         self.sound_steps = self.sound_steps.saturating_add(1);
                     }
                 }
-                // Pass the step pulse itself to a drive with nothing in it.
+                // With nothing in the drive, send the real head after the
+                // emulated one.
                 //
-                // `/DSKCHG` is a latch the drive resets on the step line's
-                // electrical edge -- whether or not the carriage moves, which at
-                // the end stop it does not. That reset is how a disk being put in
-                // is ever noticed, and the guest's polling is what performs it,
-                // so the pulse has to reach the drive even though the head stays
-                // put. It moves nothing, so it cannot disturb a read.
+                // This is the empty-drive click, and it comes from the guest: its
+                // trackdisk moves the head while polling for a disk, which is why
+                // the same poll makes a synthesized click on an image-backed bay.
+                // Passing the position on is enough to reproduce it -- nothing
+                // here invents movement, because the guest is already asking for
+                // it. Stepping is also what resets the drive's change latch, so
+                // the poll doubles as how a disk being put in gets noticed.
                 //
-                // Head *position* is deliberately not sent from here. The guest
-                // steps every 3 ms and a command over USB cannot, so chasing its
-                // intermediate positions leaves the real head lagging through a
-                // seek the emulated one has finished -- heard as a grind rather
-                // than one clean sweep. Position belongs to the capture, which
-                // moves the head once, to where the track actually is.
+                // Only while the drive is empty. With a disk in it, position
+                // belongs to the capture, which moves the head once, straight to
+                // the track. The guest steps every 3 ms and a command over USB
+                // cannot, so chasing its intermediate positions leaves the real
+                // head lagging through a seek the emulated one has finished --
+                // heard as a grind instead of one clean sweep.
                 #[cfg(feature = "fluxdrive")]
                 if !self.drives[idx].has_media() {
+                    let cylinder = self.drives[idx].cylinder;
                     if let Some(flux) = self.drives[idx].flux.as_mut() {
-                        flux.step_pulse();
+                        flux.seek(cylinder);
                     }
                 }
             }

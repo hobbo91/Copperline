@@ -192,14 +192,6 @@ pub trait FluxSource {
     /// interface needs to.
     fn seek(&mut self, cylinder: u8) -> Result<()>;
 
-    /// Emit a step pulse without moving the head anywhere in particular.
-    ///
-    /// The guest steps a drive it believes is at the end stop quite deliberately:
-    /// that is how it polls for a disk. The carriage goes nowhere, but the pulse
-    /// is what resets the drive's disk-change latch, so it has to reach the drive
-    /// even though the head does not move.
-    fn step_pulse(&mut self) -> Result<()>;
-
     /// Select which head reads.
     fn select_head(&mut self, head: Head) -> Result<()>;
 

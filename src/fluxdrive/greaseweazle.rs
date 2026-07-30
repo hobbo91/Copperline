@@ -823,17 +823,6 @@ impl FluxSource for Greaseweazle {
         Ok(())
     }
 
-    fn step_pulse(&mut self) -> Result<()> {
-        // The board's fake outward step: it drives the step line without the
-        // head going anywhere, which is exactly a poll at the end stop.
-        ensure!(
-            self.info.supports(cmd::NO_CLICK_STEP),
-            "this firmware cannot emit a step pulse on its own"
-        );
-        self.send(&[cmd::NO_CLICK_STEP, 2])
-            .context("cannot emit a step pulse")
-    }
-
     fn select_head(&mut self, head: Head) -> Result<()> {
         self.send(&[cmd::HEAD, 3, head.index()])
             .context("cannot select the head")?;
