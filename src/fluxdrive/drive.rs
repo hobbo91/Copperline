@@ -27,11 +27,20 @@ use std::thread::JoinHandle;
 /// What the emulated side asks the drive to do.
 enum Command {
     Motor(bool),
+    /// Move the real head to where the guest has stepped the emulated one.
+    ///
+    /// Sent for the guest's steps as they happen, rather than only when a track
+    /// is wanted, because the head following the stepper *is* the behaviour: it
+    /// is what makes an empty drive click as the guest polls it, and what leaves
+    /// the head where the guest believes it is.
+    Seek(u8),
     Capture {
         cylinder: u8,
         head: Head,
         revolutions: u8,
     },
+    /// Read the drive's status lines.
+    Status,
     Stop,
 }
 
@@ -48,6 +57,7 @@ pub struct CapturedTrack {
 /// What comes back from the drive's thread.
 enum Event {
     Captured(Box<CapturedTrack>),
+    Status(super::DriveStatus),
     Failed {
         cylinder: u8,
         head: Head,
@@ -73,6 +83,13 @@ pub struct FluxDrive {
     /// something is read or fails in a way that settles it, because the floppy
     /// bus never says outright.
     disk_present: Option<bool>,
+    /// The disk's own write-protect tab, as the drive senses it.
+    write_protected: Option<bool>,
+    /// A status read is outstanding, so another would only queue behind it.
+    status_pending: bool,
+    /// The cylinder the real head was last sent to, so the guest's steps are
+    /// forwarded once each rather than repeatedly.
+    sent_cylinder: Option<u8>,
     /// Set when the thread has gone, so the bay can stop asking.
     lost: bool,
 }
@@ -93,6 +110,26 @@ impl FluxDrive {
                         Command::Motor(on) => {
                             if let Err(err) = source.motor(on) {
                                 warn!("fluxdrive: cannot switch the drive motor: {err:#}");
+                            }
+                        }
+                        Command::Seek(cylinder) => {
+                            // A step that will not go through is not worth
+                            // reporting every time: the guest steps a drive it
+                            // believes is at the end stop quite deliberately.
+                            if let Err(err) = source.seek(cylinder) {
+                                debug!("fluxdrive: cannot step to cylinder {cylinder}: {err:#}");
+                            }
+                        }
+                        Command::Status => {
+                            let event = match source.status() {
+                                Ok(status) => Event::Status(status),
+                                Err(err) => {
+                                    debug!("fluxdrive: cannot read the drive status: {err:#}");
+                                    continue;
+                                }
+                            };
+                            if event_tx.send(event).is_err() {
+                                break;
                             }
                         }
                         Command::Capture {
@@ -138,8 +175,40 @@ impl FluxDrive {
             pending: None,
             motor_on: false,
             disk_present: None,
+            write_protected: None,
+            status_pending: false,
+            sent_cylinder: None,
             lost: false,
         }
+    }
+
+    /// Move the real head to `cylinder`, following the guest's stepper.
+    pub fn seek(&mut self, cylinder: u8) {
+        if self.lost || self.sent_cylinder == Some(cylinder) {
+            return;
+        }
+        if self.commands.send(Command::Seek(cylinder)).is_err() {
+            self.lost = true;
+            return;
+        }
+        self.sent_cylinder = Some(cylinder);
+    }
+
+    /// Ask for the drive's status lines, unless a read is already outstanding.
+    pub fn request_status(&mut self) {
+        if self.lost || self.status_pending || self.pending.is_some() {
+            return;
+        }
+        if self.commands.send(Command::Status).is_err() {
+            self.lost = true;
+            return;
+        }
+        self.status_pending = true;
+    }
+
+    /// The disk's write-protect tab, where the drive can report it.
+    pub fn write_protected(&self) -> Option<bool> {
+        self.write_protected
     }
 
     pub fn describe(&self) -> &str {
@@ -196,6 +265,9 @@ impl FluxDrive {
             self.lost = true;
             return false;
         }
+        // The capture seeks on the drive's thread, so record where that leaves
+        // the head or the next step would be thought already sent.
+        self.sent_cylinder = Some(cylinder);
         self.pending = Some((cylinder, head));
         true
     }
@@ -216,6 +288,15 @@ impl FluxDrive {
                     // Flux came back, so something is turning in there.
                     self.disk_present = Some(true);
                     return Some(track);
+                }
+                Ok(Event::Status(status)) => {
+                    self.status_pending = false;
+                    if let Some(present) = status.disk_present {
+                        self.disk_present = Some(present);
+                    }
+                    if let Some(protected) = status.write_protected {
+                        self.write_protected = Some(protected);
+                    }
                 }
                 Ok(Event::Failed {
                     cylinder,

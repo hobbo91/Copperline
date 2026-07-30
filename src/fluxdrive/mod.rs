@@ -71,6 +71,10 @@ pub struct DriveStatus {
     pub motor_on: bool,
     /// `/WRPROT` from the drive, where the interface can read the line.
     pub write_protected: Option<bool>,
+    /// Whether a disk is in the drive, where the interface can tell. The bus has
+    /// no line that says so outright; what it has is a change latch that stays
+    /// asserted while the slot is empty.
+    pub disk_present: Option<bool>,
 }
 
 /// Raw flux from one capture.

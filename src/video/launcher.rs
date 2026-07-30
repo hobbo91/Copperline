@@ -1694,6 +1694,9 @@ impl MachineSetup {
                 // The usual position of a lone drive on a PC cable is the
                 // default, so only an unusual one is written.
                 flux_cable: (flux.cable != "a").then(|| flux.cable.clone()),
+                // Normal is the default, so only a deliberate choice is written.
+                flux_mode: (flux.mode != crate::config::FluxMode::default())
+                    .then(|| flux.mode.label().to_string()),
             });
         }
         let playlist = &self.df_playlists[idx];
@@ -1713,6 +1716,7 @@ impl MachineSetup {
             flux: None,
             flux_port: None,
             flux_cable: None,
+            flux_mode: None,
         })
     }
 

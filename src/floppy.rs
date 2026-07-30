@@ -85,15 +85,13 @@ const MIN_STEP_PULSE_CCK: u64 = 140;
 const SEEK_REVERSAL_SETTLE_CCK: u32 = PAULA_CLOCK_HZ / 1_000 * 18; // ~18 ms on reversal
                                                                    // 300 RPM.
 const ROTATION_HZ: u32 = 5;
-/// How many whole revolutions to take of a physical track at once.
+/// How often to read a physical drive's status lines, in emulated time.
 ///
-/// Marginal oxide gives up a sector on one revolution and not the next, and the
-/// guest recovers by re-reading, so a track has to arrive with more than one
-/// reading of itself for that re-read to mean anything. Each costs a rotation of
-/// real time, so this trades how long a first read takes against how much the
-/// guest has to work with.
+/// This is how a disk being put in or taken out is noticed, and how the tab is
+/// sensed. Each read is a couple of USB round trips, so a few times a second
+/// costs nothing and is far quicker than anyone can change a disk.
 #[cfg(feature = "fluxdrive")]
-const FLUX_CAPTURE_REVOLUTIONS: u8 = 3;
+const FLUX_STATUS_POLL_CCK: u64 = (PAULA_CLOCK_HZ / 4) as u64;
 // Turbo mode defers the burst completion of a freshly armed DMA by two
 // scanlines of emulated time (the same deferral WinUAE/FS-UAE apply to
 // their instant path): loaders commonly write DSKLEN and only then clear
@@ -377,6 +375,9 @@ impl FloppyController {
     /// Whole multiple of real speed the data path runs at. Turbo paces the
     /// platter at real speed between bursts, so it maps to 1 here.
     fn speed_multiplier(&self) -> u32 {
+        if self.physical_media() {
+            return 1;
+        }
         match self.speed_percent {
             0..=100 => 1,
             p => u32::from(p / 100),
@@ -384,7 +385,29 @@ impl FloppyController {
     }
 
     fn turbo(&self) -> bool {
-        self.speed_percent == SPEED_TURBO
+        !self.physical_media() && self.speed_percent == SPEED_TURBO
+    }
+
+    /// Whether the drive feeding Paula is a real one.
+    ///
+    /// Drive speed is a property of the emulated data path, and there is no such
+    /// path here: the cells arrive at whatever rate a disk turning at 300 rpm in
+    /// the world presents them. Running the head faster than that would only
+    /// read past the end of what has been captured. The setting is left to the
+    /// bays that are backed by images.
+    #[cfg(feature = "fluxdrive")]
+    fn physical_media(&self) -> bool {
+        let reading = self
+            .dma
+            .as_ref()
+            .map(|dma| dma.drive)
+            .or_else(|| self.selected_drive());
+        reading.is_some_and(|idx| self.drives[idx].flux.is_some())
+    }
+
+    #[cfg(not(feature = "fluxdrive"))]
+    fn physical_media(&self) -> bool {
+        false
     }
 
     pub fn cia_a_status_bits(&self) -> u8 {
@@ -498,6 +521,7 @@ impl FloppyController {
         drive_idx: usize,
         drive: crate::fluxdrive::drive::FluxDrive,
         write_protected: bool,
+        mode: crate::config::FluxMode,
     ) -> Result<()> {
         ensure!(
             drive_idx < self.drives.len(),
@@ -510,6 +534,11 @@ impl FloppyController {
         let bay = &mut self.drives[drive_idx];
         bay.write_protected_target = write_protected;
         bay.write_protected_sense = write_protected;
+        bay.flux_write_protected = write_protected;
+        bay.flux_mode = mode;
+        // Take a disk to be there until the drive says otherwise, so /RDY comes
+        // up and the guest tries to read at all.
+        bay.flux_media_seen = true;
         bay.flux_tracks.clear();
         bay.flux_filler_track = None;
         bay.flux = Some(drive);
@@ -675,7 +704,35 @@ impl FloppyController {
                 // (a silent poll, which NoClick patches rely on), and
                 // pulses faster than the mechanism move nothing.
                 if stepper_fired {
-                    self.sound_steps = self.sound_steps.saturating_add(1);
+                    // A physical drive makes its own noise; synthesizing more
+                    // on top would double every click.
+                    #[cfg(feature = "fluxdrive")]
+                    let synthesize = self.drives[idx].flux.is_none();
+                    #[cfg(not(feature = "fluxdrive"))]
+                    let synthesize = true;
+                    if synthesize {
+                        self.sound_steps = self.sound_steps.saturating_add(1);
+                    }
+                }
+                // With no disk in it, send the real head after the emulated
+                // one. This is the empty-drive click: the guest polls for a
+                // disk by stepping, and a real mechanism answers audibly.
+                //
+                // Only with no disk, though. While there is one, head movement
+                // belongs to the capture, which the interface precedes with its
+                // own settle time. Stepping ahead of it leaves that seek with
+                // nothing to do, so the read begins while the head is still
+                // ringing -- good flux off the wrong part of the disk, which
+                // the guest cannot make sense of at all.
+                #[cfg(feature = "fluxdrive")]
+                {
+                    let cylinder = self.drives[idx].cylinder;
+                    let empty = !self.drives[idx].has_media();
+                    if let Some(flux) = self.drives[idx].flux.as_mut() {
+                        if empty {
+                            flux.seek(cylinder);
+                        }
+                    }
                 }
             }
 
@@ -1345,6 +1402,12 @@ impl FloppyController {
     /// ramp instead of switching.
     pub fn motor_spin_levels(&self) -> [f32; 4] {
         std::array::from_fn(|idx| {
+            // A physical drive is making the real sound in the room; adding a
+            // synthesized spindle on top of it would only muddy that.
+            #[cfg(feature = "fluxdrive")]
+            if self.drives[idx].flux.is_some() {
+                return 0.0;
+            }
             self.drives[idx].motor_cck.min(MOTOR_READY_CCK) as f32 / MOTOR_READY_CCK as f32
         })
     }
@@ -1671,19 +1734,65 @@ impl FloppyController {
     fn ensure_flux_track(&mut self, idx: usize, track: usize) {
         let cylinder = (track / SIDES) as u8;
         let head = crate::fluxdrive::Head::from_index(u8::from(!track.is_multiple_of(SIDES)));
+        let revolutions = self.drives[idx].flux_mode.revolutions();
         let drive = &mut self.drives[idx];
 
         // A real drive reads nothing until the platter is at speed, and drive
         // select alone gets here with the motor still off.
         let at_speed = drive.motor_on && drive.motor_cck >= MOTOR_READY_CCK;
+        let motor_on = drive.motor_on;
+        let elapsed = drive.elapsed_cck;
+        let due_status = elapsed >= drive.flux_status_cck;
+        if due_status {
+            drive.flux_status_cck = elapsed + FLUX_STATUS_POLL_CCK;
+        }
+
+        // Watch the drive's own lines for a disk going in or coming out, and for
+        // the tab. Nothing tells the emulator otherwise: unlike an image, nobody
+        // announces a change to a real drive.
+        let (sensed_media, sensed_tab) = {
+            let Some(flux) = drive.flux.as_mut() else {
+                return;
+            };
+            flux.set_motor(motor_on);
+            if due_status {
+                flux.request_status();
+            }
+            (flux.disk_present(), flux.write_protected())
+        };
+        if let Some(present) = sensed_media {
+            // A disk arriving or leaving is a change, and the guest is told the
+            // same way it is told about an image being swapped.
+            if present != drive.flux_media_seen {
+                drive.flux_media_seen = present;
+                drive.set_disk_change(true);
+                drive.flux_tracks.clear();
+                drive.flux_filler_track = None;
+                drive.cached = CachedTrack::default();
+                drive.cached_track = None;
+                log::info!(
+                    "floppy.df{idx} {}",
+                    if present {
+                        "disk in the physical drive"
+                    } else {
+                        "no disk in the physical drive"
+                    }
+                );
+            }
+        }
+        if let Some(protected) = sensed_tab {
+            // Either the configuration or the disk's own tab is enough to
+            // protect it, and neither overrides the other.
+            let effective = drive.flux_write_protected || protected;
+            drive.set_write_protected(effective);
+        }
+
         let Some(flux) = drive.flux.as_mut() else {
             return;
         };
-        flux.set_motor(drive.motor_on);
         if !at_speed {
             log::trace!(
-                "floppy.df{idx} flux: not at speed (motor={} spun={}/{MOTOR_READY_CCK})",
-                drive.motor_on,
+                "floppy.df{idx} flux: not at speed (motor={motor_on} spun={}/{MOTOR_READY_CCK})",
                 drive.motor_cck,
             );
             return;
@@ -1739,7 +1848,7 @@ impl FloppyController {
             return;
         }
 
-        if flux.request(cylinder, head, FLUX_CAPTURE_REVOLUTIONS) {
+        if flux.request(cylinder, head, revolutions) {
             debug!(
                 "floppy.df{idx} flux: reading track {track} (cyl {cylinder} head {})",
                 head.index()
@@ -1848,6 +1957,24 @@ struct FloppyDrive {
     #[cfg(feature = "fluxdrive")]
     #[serde(skip)]
     flux_filler_track: Option<usize>,
+    // How many revolutions of each track to capture.
+    #[cfg(feature = "fluxdrive")]
+    #[serde(skip)]
+    flux_mode: crate::config::FluxMode,
+    // When the drive's status lines are next worth reading.
+    #[cfg(feature = "fluxdrive")]
+    #[serde(skip)]
+    flux_status_cck: u64,
+    // Whether a disk was last sensed in the physical drive, so one going in or
+    // coming out is noticed once rather than every poll.
+    #[cfg(feature = "fluxdrive")]
+    #[serde(skip)]
+    flux_media_seen: bool,
+    // Write protection the configuration asks for, kept apart from the disk's
+    // own tab so the two can be combined without either being lost.
+    #[cfg(feature = "fluxdrive")]
+    #[serde(skip)]
+    flux_write_protected: bool,
 }
 
 impl Default for FloppyDrive {
@@ -1883,6 +2010,14 @@ impl Default for FloppyDrive {
             flux_tracks: Vec::new(),
             #[cfg(feature = "fluxdrive")]
             flux_filler_track: None,
+            #[cfg(feature = "fluxdrive")]
+            flux_mode: crate::config::FluxMode::default(),
+            #[cfg(feature = "fluxdrive")]
+            flux_status_cck: 0,
+            #[cfg(feature = "fluxdrive")]
+            flux_media_seen: false,
+            #[cfg(feature = "fluxdrive")]
+            flux_write_protected: true,
         }
     }
 }
@@ -1940,7 +2075,7 @@ impl FloppyDrive {
     fn has_media(&self) -> bool {
         #[cfg(feature = "fluxdrive")]
         if let Some(flux) = self.flux.as_ref() {
-            return flux.disk_present().unwrap_or(true);
+            return flux.disk_present().unwrap_or(self.flux_media_seen);
         }
         self.image.is_some()
     }

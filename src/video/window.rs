@@ -1998,9 +1998,14 @@ impl App {
                 let _ = proxy.send_event(());
             }));
         }
-        event_loop
+        let outcome = event_loop
             .run_app(&mut app)
-            .map_err(|e| anyhow!("event loop: {e}"))?;
+            .map_err(|e| anyhow!("event loop: {e}"));
+        // Stop the spindle and hand the interface back, rather than leaving it
+        // to however the host tears the process down.
+        #[cfg(feature = "fluxdrive")]
+        app.emu.bus_mut().floppy.release_flux_drives();
+        outcome?;
         Ok(())
     }
 }
@@ -2038,14 +2043,26 @@ impl App {
             self.recover_audio_if_device_lost();
             self.render_emulated_frame_if_needed();
             if self.dump_frame_if_due() {
+                self.release_physical_drives();
                 return Ok(());
             }
             self.fire_scheduled_events();
             self.fire_auto_save_state();
             if self.fire_auto_shot() {
+                self.release_physical_drives();
                 return Ok(());
             }
         }
+    }
+
+    /// Stop any physical drive's spindle and hand its interface back.
+    ///
+    /// Worth doing on the way out rather than leaving it to the process ending:
+    /// a motor left running wears the disk, and while the interface is open
+    /// nothing else can have it.
+    fn release_physical_drives(&mut self) {
+        #[cfg(feature = "fluxdrive")]
+        self.emu.bus_mut().floppy.release_flux_drives();
     }
 
     /// Arm every scheduled capture and input flag: pending (parse-time)
@@ -5818,6 +5835,11 @@ impl App {
                     return;
                 }
             };
+        // Let go of any physical drive the live machine holds before building
+        // the replacement. Only one process can have the interface open, and
+        // the new machine opens it here -- before the old one would be dropped.
+        #[cfg(feature = "fluxdrive")]
+        self.emu.bus_mut().floppy.release_flux_drives();
         // The launcher boots a fresh machine, never a save state, so a real
         // ROM is required here.
         let emu = match crate::emulator::build_machine(&cfg, audio, true, false) {

@@ -1049,6 +1049,62 @@ impl FluxInterface {
     }
 }
 
+/// How hard to work at reading a physical track.
+///
+/// The one lever that matters is how many whole revolutions of a track are
+/// captured at once. Each costs a rotation of real time, and each is an
+/// independent reading of the same track: marginal oxide gives up a sector on one
+/// and not the next, and the guest's own re-read is what recovers it, so more
+/// revolutions means a slower read that fails less often.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FluxMode {
+    /// Five revolutions. For reading a disk that is failing, or archiving one
+    /// where a second attempt is not wanted.
+    Careful,
+    /// Three revolutions: quick enough to boot with, with two spare readings of
+    /// every track for the guest to fall back on.
+    #[default]
+    Normal,
+    /// Two revolutions. Noticeably quicker, and still leaves the guest one
+    /// re-read before it has to ask the drive again.
+    Fast,
+    /// One revolution -- as fast as a real drive can go. A sector the head
+    /// mis-reads has no second reading behind it, so the guest must wait for the
+    /// track to be captured again.
+    Turbo,
+}
+
+impl FluxMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "careful" | "slow" => Some(Self::Careful),
+            "normal" => Some(Self::Normal),
+            "fast" => Some(Self::Fast),
+            "turbo" => Some(Self::Turbo),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Careful => "careful",
+            Self::Normal => "normal",
+            Self::Fast => "fast",
+            Self::Turbo => "turbo",
+        }
+    }
+
+    /// Whole revolutions to capture per track.
+    pub fn revolutions(self) -> u8 {
+        match self {
+            Self::Careful => 5,
+            Self::Normal => 3,
+            Self::Fast => 2,
+            Self::Turbo => 1,
+        }
+    }
+}
+
 /// A real 3.5" drive attached to one floppy bay, from `[floppy.dfN] flux = ...`.
 ///
 /// Held apart from [`FloppyDriveConfig`] because a physical drive has no image
@@ -1067,6 +1123,8 @@ pub struct FloppyFluxConfig {
     pub port: Option<String>,
     /// Which drive on the cable: `a`/`b` on a PC cable, `0`..`3` on Shugart.
     pub cable: String,
+    /// How many revolutions of each track to capture.
+    pub mode: FluxMode,
 }
 
 impl Default for FloppyFluxConfig {
@@ -1079,6 +1137,7 @@ impl Default for FloppyFluxConfig {
             write_protected: true,
             port: None,
             cable: "a".to_string(),
+            mode: FluxMode::default(),
         }
     }
 }
@@ -1710,6 +1769,9 @@ pub struct ConfigOverrides {
     /// Which drive on the cable (`--floppy-flux-cable DFN CABLE`). Same as
     /// `[floppy.dfN] flux_cable`.
     pub floppy_flux_cable: [Option<String>; 4],
+    /// How hard to work at each track (`--floppy-flux-mode DFN MODE`). Same as
+    /// `[floppy.dfN] flux_mode`.
+    pub floppy_flux_mode: [Option<String>; 4],
     /// Let the emulator write to the physical disk (`--floppy-flux-writable
     /// DFN`), leaving only the disk's own tab in the way. Same as
     /// `[floppy.dfN] write_protected = false`.
@@ -1799,6 +1861,7 @@ impl ConfigOverrides {
             && self.floppy_flux.iter().all(Option::is_none)
             && self.floppy_flux_port.iter().all(Option::is_none)
             && self.floppy_flux_cable.iter().all(Option::is_none)
+            && self.floppy_flux_mode.iter().all(Option::is_none)
             && !self.floppy_flux_writable.iter().any(|w| *w)
             && self.joystick.is_none()
             && self.mouse_sensitivity.is_none()
@@ -1875,6 +1938,7 @@ impl ConfigOverrides {
                 let touched = self.floppy_flux[idx].is_some()
                     || self.floppy_flux_port[idx].is_some()
                     || self.floppy_flux_cable[idx].is_some()
+                    || self.floppy_flux_mode[idx].is_some()
                     || self.floppy_flux_writable[idx];
                 if !touched {
                     continue;
@@ -1893,6 +1957,9 @@ impl ConfigOverrides {
                 }
                 if let Some(cable) = &self.floppy_flux_cable[idx] {
                     bay.flux_cable = Some(cable.clone());
+                }
+                if let Some(mode) = &self.floppy_flux_mode[idx] {
+                    bay.flux_mode = Some(mode.clone());
                 }
                 if self.floppy_flux_writable[idx] {
                     bay.write_protected = Some(false);
@@ -2673,6 +2740,9 @@ pub(crate) struct RawFloppyDrive {
     /// Which drive on the cable: `a`/`b` on a PC cable, `0`..`3` on Shugart.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) flux_cable: Option<String>,
+    /// How hard to work at each track: careful, normal, fast, or turbo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) flux_mode: Option<String>,
 }
 
 /// Convert a parsed `[ide]`/`[scsi]` drive entry into a `DriveImage`,
@@ -4223,15 +4293,28 @@ fn parse_floppy(raw: RawFloppy) -> Result<(FloppyConfig, [bool; 4], [Vec<PathBuf
             }
             let cable = raw_drive.flux_cable.unwrap_or_else(|| "a".to_string());
             validate_flux_cable(idx, &cable)?;
+            let mode = match raw_drive.flux_mode.as_deref() {
+                None => FluxMode::default(),
+                Some(value) => FluxMode::parse(value).ok_or_else(|| {
+                    anyhow!(
+                        "floppy.df{idx} flux_mode = \"{value}\" is not a known mode; \
+                         expected \"careful\", \"normal\", \"fast\", or \"turbo\""
+                    )
+                })?,
+            };
             flux[idx] = Some(FloppyFluxConfig {
                 interface,
                 write_protected: raw_drive.write_protected.unwrap_or(true),
                 port: raw_drive.flux_port.filter(|p| !p.trim().is_empty()),
                 cable,
+                mode,
             });
             continue;
         }
-        if raw_drive.flux_port.is_some() || raw_drive.flux_cable.is_some() {
+        if raw_drive.flux_port.is_some()
+            || raw_drive.flux_cable.is_some()
+            || raw_drive.flux_mode.is_some()
+        {
             bail!(
                 "floppy.df{idx} configures a flux interface but has no \
                  flux = \"greaseweazle\""

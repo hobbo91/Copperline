@@ -28,6 +28,8 @@ mod cmd {
     pub const GET_INFO: u8 = 0;
     pub const SEEK: u8 = 2;
     pub const HEAD: u8 = 3;
+    pub const SET_PARAMS: u8 = 4;
+    pub const GET_PARAMS: u8 = 5;
     pub const MOTOR: u8 = 6;
     pub const READ_FLUX: u8 = 7;
     pub const GET_FLUX_STATUS: u8 = 9;
@@ -43,6 +45,11 @@ mod cmd {
 mod get_info {
     pub const FIRMWARE: u8 = 0;
     pub const CURRENT_DRIVE: u8 = 7;
+}
+
+/// `{Get,Set}Params` sub-indexes.
+mod params {
+    pub const DELAYS: u8 = 0;
 }
 
 /// Command acknowledgements.
@@ -175,6 +182,24 @@ const PIN_TRK0: u8 = 26;
 /// `/DENSEL`. A drive that can take both densities decides from this line which
 /// write current and data rate to expect.
 const PIN_DENSITY_SELECT: u8 = 2;
+/// `/WRPROT`, asserted (low) while the disk's tab is open -- which on a 3.5"
+/// disk means the shutter hole is *closed*. The drive senses it mechanically.
+const PIN_WRITE_PROTECT: u8 = 28;
+/// `/DSKCHG` on a PC drive: asserted (low) from the moment a disk is removed
+/// until a step happens with one in place. An empty slot therefore holds it
+/// asserted, which is the closest the bus comes to reporting whether a disk is
+/// there at all. Not every drive fits this line, so it is read as "unknown when
+/// unsupported" rather than relied upon.
+const PIN_DISK_CHANGE: u8 = 34;
+
+/// Interval between head steps to ask the interface for, in microseconds.
+///
+/// An Amiga's trackdisk steps every 3 ms, and the emulated stepper charges the
+/// same. The interface's own default is far slower, which leaves the real head
+/// still travelling long after the emulated one has arrived -- audible as a
+/// drawn-out seek, and slow enough that a multi-cylinder move dominates the time
+/// a track takes to read.
+const STEP_INTERVAL_US: u16 = 3_000;
 
 /// A capture is asked for by revolution count, but the firmware also wants a
 /// tick ceiling so a stopped disk cannot hang the read forever. Nothing is
@@ -414,6 +439,11 @@ impl Greaseweazle {
         gw.send(&[cmd::MOTOR, 4, drive.unit, 0])
             .context("cannot stop the drive motor")?;
         gw.motor_on = false;
+        // Step at the rate the emulated stepper does, so the real head keeps up
+        // with the one the guest thinks it is moving.
+        if let Err(err) = gw.set_step_interval(STEP_INTERVAL_US) {
+            warn!("fluxdrive: cannot match the drive's step rate to the Amiga's: {err:#}");
+        }
 
         Ok(gw)
     }
@@ -591,11 +621,70 @@ impl Greaseweazle {
     /// Whether the head is over cylinder 0, from the one absolute position
     /// signal the bus offers.
     fn at_track0(&mut self) -> Result<bool> {
-        self.send(&[cmd::GET_PIN, 3, PIN_TRK0])?;
+        Ok(self.read_pin(PIN_TRK0)?.is_some_and(|asserted| asserted))
+    }
+
+    /// Read one drive line, or `None` when this board cannot reach that pin.
+    ///
+    /// Answers whether the signal is *asserted*, having already accounted for
+    /// the bus being active low.
+    fn read_pin(&mut self, pin: u8) -> Result<Option<bool>> {
+        match self.send(&[cmd::GET_PIN, 3, pin]) {
+            Ok(()) => {}
+            Err(err) => {
+                let unsupported = err
+                    .downcast_ref::<CommandError>()
+                    .is_some_and(|e| e.code == ack::BAD_PIN || e.code == ack::BAD_COMMAND);
+                if unsupported {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+        }
         let mut level = [0u8; 1];
         self.read_exact(&mut level, Instant::now() + COMMAND_TIMEOUT)?;
-        // Active low.
-        Ok(level[0] == 0)
+        Ok(Some(level[0] == 0))
+    }
+
+    /// Ask the interface to step the head at the rate an Amiga does.
+    ///
+    /// The delay block grew across firmware revisions, so its length is
+    /// discovered by asking for the longest and shortening until the board
+    /// accepts it; the values are then written back with only the step interval
+    /// changed, leaving the board's other timings as its owner set them.
+    fn set_step_interval(&mut self, microseconds: u16) -> Result<()> {
+        let mut delays = Vec::new();
+        for size in [16u8, 14, 12, 10] {
+            match self.send(&[cmd::GET_PARAMS, 4, params::DELAYS, size]) {
+                Ok(()) => {
+                    delays.resize(usize::from(size), 0);
+                    self.read_exact(&mut delays, Instant::now() + COMMAND_TIMEOUT)?;
+                    break;
+                }
+                Err(err) => {
+                    let too_long = err
+                        .downcast_ref::<CommandError>()
+                        .is_some_and(|e| e.code == ack::BAD_COMMAND);
+                    if !too_long {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        ensure!(
+            delays.len() >= 4,
+            "the board did not report its drive delays"
+        );
+        // Second of the little-endian 16-bit fields: select, step, settle, ...
+        delays[2..4].copy_from_slice(&microseconds.to_le_bytes());
+
+        let mut command = Vec::with_capacity(delays.len() + 3);
+        command.push(cmd::SET_PARAMS);
+        command.push(u8::try_from(delays.len() + 3).context("delay block is too long")?);
+        command.push(params::DELAYS);
+        command.extend_from_slice(&delays);
+        self.send(&command)
+            .context("cannot set the drive step interval")
     }
 }
 
@@ -777,10 +866,13 @@ impl FluxSource for Greaseweazle {
         let mut status = DriveStatus {
             cylinder: self.cylinder,
             motor_on: self.motor_on,
-            // Nothing on the bus reports write protection to the interface;
-            // the drive refuses the write instead. Left unknown rather than
-            // guessed, so a caller cannot mistake it for "writable".
-            write_protected: None,
+            // The drive senses the tab mechanically and puts it on /WRPROT.
+            // A board that cannot reach the pin leaves this unknown, which must
+            // never be read as "writable".
+            write_protected: self.read_pin(PIN_WRITE_PROTECT)?,
+            // /DSKCHG stays asserted while the slot is empty, so an unasserted
+            // line means a disk is in there and has been stepped on since.
+            disk_present: self.read_pin(PIN_DISK_CHANGE)?.map(|changed| !changed),
         };
         // Later firmware can report the head position and motor state from the
         // board's own view, which catches a drive that was moved by something

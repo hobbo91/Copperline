@@ -486,6 +486,14 @@ where
                 overrides.floppy_flux_cable[idx] = Some(cable);
             }
             #[cfg(feature = "fluxdrive")]
+            "--floppy-flux-mode" => {
+                const USAGE: &str = "--floppy-flux-mode requires DFN MODE \
+                                     (careful, normal, fast, or turbo)";
+                let (drive_s, mode) = two_values(&mut args, USAGE)?;
+                let idx = parse_floppy_drive_idx(&drive_s, "--floppy-flux-mode")?;
+                overrides.floppy_flux_mode[idx] = Some(mode);
+            }
+            #[cfg(feature = "fluxdrive")]
             "--floppy-flux-writable" => {
                 const USAGE: &str = "--floppy-flux-writable requires DFN";
                 let drive_s = args.next().ok_or_else(|| anyhow!(USAGE))?;

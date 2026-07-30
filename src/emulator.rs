@@ -1964,7 +1964,12 @@ fn attach_flux_drives(floppy: &mut FloppyController, cfg: &Config) -> Result<()>
                  set write_protected = false to write to the disk"
             );
         }
-        floppy.attach_flux_drive(idx, drive, flux_cfg.write_protected)?;
+        info!(
+            "floppy.df{idx} reading {} revolutions of each track ({} mode)",
+            flux_cfg.mode.revolutions(),
+            flux_cfg.mode.label(),
+        );
+        floppy.attach_flux_drive(idx, drive, flux_cfg.write_protected, flux_cfg.mode)?;
     }
     Ok(())
 }
