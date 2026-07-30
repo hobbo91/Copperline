@@ -871,8 +871,13 @@ impl FluxSource for Greaseweazle {
             // never be read as "writable".
             write_protected: self.read_pin(PIN_WRITE_PROTECT)?,
             // /DSKCHG stays asserted while the slot is empty, so an unasserted
-            // line means a disk is in there and has been stepped on since.
-            disk_present: self.read_pin(PIN_DISK_CHANGE)?.map(|changed| !changed),
+            // line means a disk is in there and has been stepped on since. The
+            // line only exists on a PC cable: Shugart wiring puts something else
+            // on that pin, so there is nothing to read.
+            disk_present: match self.drive.bus {
+                BusType::IbmPc => self.read_pin(PIN_DISK_CHANGE)?.map(|changed| !changed),
+                BusType::Shugart => None,
+            },
         };
         // Later firmware can report the head position and motor state from the
         // board's own view, which catches a drive that was moved by something

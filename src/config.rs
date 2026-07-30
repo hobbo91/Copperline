@@ -1061,16 +1061,19 @@ pub enum FluxMode {
     /// Five revolutions. For reading a disk that is failing, or archiving one
     /// where a second attempt is not wanted.
     Careful,
-    /// Three revolutions: quick enough to boot with, with two spare readings of
-    /// every track for the guest to fall back on.
+    /// Three revolutions, for a disk that is giving trouble without being bad
+    /// enough to want the careful setting.
+    Thorough,
+    /// Two revolutions: one reading to use and one to fall back on, which is
+    /// what a healthy disk needs and no more.
     #[default]
     Normal,
-    /// Two revolutions. Noticeably quicker, and still leaves the guest one
-    /// re-read before it has to ask the drive again.
+    /// One revolution -- as fast as the disk can be read at all. A sector the
+    /// head mis-reads has no second reading behind it, so the guest waits for
+    /// the track to be captured again.
     Fast,
-    /// One revolution -- as fast as a real drive can go. A sector the head
-    /// mis-reads has no second reading behind it, so the guest must wait for the
-    /// track to be captured again.
+    /// As `fast`, and reads the other side of a cylinder while the head is
+    /// already there, since AmigaDOS works through tracks in pairs.
     Turbo,
 }
 
@@ -1078,6 +1081,7 @@ impl FluxMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "careful" | "slow" => Some(Self::Careful),
+            "thorough" => Some(Self::Thorough),
             "normal" => Some(Self::Normal),
             "fast" => Some(Self::Fast),
             "turbo" => Some(Self::Turbo),
@@ -1088,18 +1092,25 @@ impl FluxMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Careful => "careful",
+            Self::Thorough => "thorough",
             Self::Normal => "normal",
             Self::Fast => "fast",
             Self::Turbo => "turbo",
         }
     }
 
+    /// Whether to read the other side of a cylinder while the head is there.
+    pub fn reads_ahead(self) -> bool {
+        matches!(self, Self::Turbo)
+    }
+
     /// Whole revolutions to capture per track.
     pub fn revolutions(self) -> u8 {
         match self {
             Self::Careful => 5,
-            Self::Normal => 3,
-            Self::Fast => 2,
+            Self::Thorough => 3,
+            Self::Normal => 2,
+            Self::Fast => 1,
             Self::Turbo => 1,
         }
     }
@@ -4298,7 +4309,7 @@ fn parse_floppy(raw: RawFloppy) -> Result<(FloppyConfig, [bool; 4], [Vec<PathBuf
                 Some(value) => FluxMode::parse(value).ok_or_else(|| {
                     anyhow!(
                         "floppy.df{idx} flux_mode = \"{value}\" is not a known mode; \
-                         expected \"careful\", \"normal\", \"fast\", or \"turbo\""
+                         expected \"careful\", \"thorough\", \"normal\", \"fast\", or \"turbo\""
                     )
                 })?,
             };

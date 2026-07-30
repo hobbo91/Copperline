@@ -360,3 +360,35 @@ fn decoded_sectors_match_an_image_of_the_same_disk() {
     println!("{compared} sectors identical to the reference image");
     drive.motor(false).expect("spin the disk down");
 }
+
+/// Watch the drive's status lines while a disk is taken out and put back.
+///
+/// Pin 34 is `/DSKCHG` on some 3.5" drives and `/RDY` on others -- it is
+/// jumper-selectable on many -- and the two mean almost opposite things. Which
+/// one this drive fits decides whether an empty slot can be sensed at all, so it
+/// is worth establishing rather than assuming.
+///
+/// Run it, then take the disk out and put it back while it watches.
+#[test]
+#[ignore = "requires someone to eject and re-insert a disk while it runs"]
+fn watch_the_drive_status_lines() {
+    let mut drive = open_drive();
+    println!("{}", drive.describe());
+    println!("watching for 40s -- eject the disk, wait, then put it back\n");
+
+    let start = std::time::Instant::now();
+    let mut last = String::new();
+    while start.elapsed() < std::time::Duration::from_secs(40) {
+        let status = drive.status().expect("read the drive status");
+        let line = format!(
+            "disk_present={:?} write_protected={:?} cylinder={:?} motor={}",
+            status.disk_present, status.write_protected, status.cylinder, status.motor_on,
+        );
+        if line != last {
+            println!("[{:5.1}s] {line}", start.elapsed().as_secs_f64());
+            last = line;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    println!("\ndone");
+}

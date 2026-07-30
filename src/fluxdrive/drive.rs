@@ -21,7 +21,9 @@ use super::cells::{recover_cells, RecoveredTrack};
 use super::{FluxSource, Head};
 use anyhow::{anyhow, Result};
 use log::{debug, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 /// What the emulated side asks the drive to do.
@@ -92,6 +94,7 @@ pub struct FluxDrive {
     sent_cylinder: Option<u8>,
     /// Set when the thread has gone, so the bay can stop asking.
     lost: bool,
+    stopping: Arc<AtomicBool>,
 }
 
 impl FluxDrive {
@@ -100,11 +103,19 @@ impl FluxDrive {
         let description = source.describe();
         let (commands, command_rx) = std::sync::mpsc::channel::<Command>();
         let (event_tx, events) = std::sync::mpsc::channel::<Event>();
+        // Set the moment the machine is on its way out, so the drive stops as
+        // promptly as a real one does instead of finishing everything it was
+        // asked for first.
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
 
         let worker = std::thread::Builder::new()
             .name("fluxdrive".to_string())
             .spawn(move || {
                 while let Ok(command) = command_rx.recv() {
+                    if worker_stopping.load(Ordering::Relaxed) {
+                        break;
+                    }
                     match command {
                         Command::Stop => break,
                         Command::Motor(on) => {
@@ -137,7 +148,13 @@ impl FluxDrive {
                             head,
                             revolutions,
                         } => {
-                            let outcome = capture(source.as_mut(), cylinder, head, revolutions);
+                            let outcome = capture(
+                                source.as_mut(),
+                                cylinder,
+                                head,
+                                revolutions,
+                                &worker_stopping,
+                            );
                             let event = match outcome {
                                 Ok(track) => Event::Captured(Box::new(track)),
                                 Err(err) => {
@@ -179,6 +196,7 @@ impl FluxDrive {
             status_pending: false,
             sent_cylinder: None,
             lost: false,
+            stopping,
         }
     }
 
@@ -333,7 +351,11 @@ fn capture(
     cylinder: u8,
     head: Head,
     revolutions: u8,
+    stopping: &AtomicBool,
 ) -> Result<CapturedTrack> {
+    if stopping.load(Ordering::Relaxed) {
+        return Err(anyhow!("the machine is stopping"));
+    }
     source.seek(cylinder)?;
     source.select_head(head)?;
     let flux = source.read_flux(revolutions)?;
@@ -366,6 +388,9 @@ fn capture(
 
 impl Drop for FluxDrive {
     fn drop(&mut self) {
+        // Tell the thread to give up on anything it has not started, so the
+        // longest this can wait is the one rotation already under way.
+        self.stopping.store(true, Ordering::Relaxed);
         let _ = self.commands.send(Command::Stop);
         if let Some(worker) = self.worker.take() {
             // A capture already under way finishes first; it is one rotation,
