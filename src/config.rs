@@ -1124,16 +1124,21 @@ impl FluxMode {
 /// has not stepped since, it reads "changed" indefinitely and says nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FluxDiskChange {
-    /// Find out by reading a little of the disk: no index pulse coming round
-    /// means nothing is turning, so the slot is empty. Costs a rotation to ask,
-    /// and works whatever the drive does with its change line.
+    /// Read `/DSKCHG`, which is what an Amiga does.
+    ///
+    /// The line is a latch: the drive asserts it when a disk is taken out and
+    /// clears it once the head steps with one back in. So it reads "no disk"
+    /// until something steps -- and what steps is the guest, polling an empty
+    /// drive a track in and out about once a second. That poll is the click, and
+    /// resolving this line is what it is for: a machine started with a disk in
+    /// clicks once or twice, the latch clears, and the disk is found. Which is
+    /// exactly what a real Amiga does.
     #[default]
-    Probe,
-    /// Believe `/DSKCHG`. Silent and immediate where the drive drives it, but
-    /// measured on a real 3.5" drive it read "changed" with a disk sitting in the
-    /// slot until something stepped the head -- so a machine that believed it
-    /// reported an empty drive that was not empty.
     Pin,
+    /// Find out by reading a little of the disk instead: no index pulse coming
+    /// round means nothing is turning, so the slot is empty. Spins the spindle to
+    /// ask, but does not need the drive to drive its change line at all.
+    Probe,
 }
 
 impl FluxDiskChange {

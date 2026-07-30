@@ -1802,7 +1802,12 @@ impl FloppyController {
             // same signal, so when it reports nothing there, ask the disk itself
             // now and then. The guest will not spin a drive it believes is empty,
             // which would otherwise leave a disk put in while it runs unnoticed.
-            if sensed_media == Some(false) && due_probe {
+            // Whenever there is no positive word that a disk is there -- not
+            // merely when one is known to be absent. Nothing reports a disk
+            // going in, so an unknown that is never asked about stays unknown,
+            // and the machine goes on believing a drive it has never read is
+            // loaded.
+            if sensed_media != Some(true) && due_probe {
                 drive.flux_probe_cck = now + FLUX_PROBE_INTERVAL_CCK;
                 if let Some(flux) = drive.flux.as_mut() {
                     flux.probe_for_disk();

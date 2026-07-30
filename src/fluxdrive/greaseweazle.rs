@@ -911,11 +911,18 @@ impl FluxSource for Greaseweazle {
         };
 
         let capture = decode_flux_stream(&stream, self.info.sample_freq)?;
-        ensure!(
-            capture.revolutions() >= usize::from(revolutions),
-            "the capture holds {} whole revolutions, not the {revolutions} asked for",
-            capture.revolutions()
-        );
+        if capture.revolutions() < usize::from(revolutions) {
+            // Too few index pulses came round. The board reports an outright
+            // absence of them itself, but a read that ends early -- because the
+            // tick ceiling ran out with nothing turning -- arrives here instead,
+            // meaning the same thing: no disk. Said in the same words, so a
+            // caller does not have to tell the two apart.
+            return Err(CommandError {
+                command: cmd::READ_FLUX,
+                code: ack::NO_INDEX,
+            }
+            .into());
+        }
         Ok(capture)
     }
 
